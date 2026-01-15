@@ -1,0 +1,57 @@
+// ============================================================================
+// WMI-A1_L2_Remote_Process_Creation_Source (Composite L2)
+// Status: PRODUCTION READY (Temporal Joins Fixed)
+// Author: Ala Dabat
+// Version: 2026-01-15 (v2)
+// Platform: Microsoft Defender XDR Advanced Hunting (MDE)
+// Tables: DeviceProcessEvents (required), DeviceNetworkEvents (optional)
+// MITRE: T1047 (WMI), T1021.003 (DCOM/RPC), TA0008 (Lateral Movement), TA0002 (Execution)
+// ============================================================================
+let lookback = 7d;
+let TimeWindow = 5m; // Tight correlation window
+
+let PayloadHints = dynamic([
+  "powershell","pwsh","cmd.exe","mshta","rundll32","regsvr32","wscript","cscript",
+  "-enc","encodedcommand","frombase64string","iex","javascript:","vbscript:","http://","https://","\\\\"
+]);
+
+// 1. BASELINE TRUTH (The Event)
+let L2_Base = 
+    DeviceProcessEvents
+    | where Timestamp >= ago(lookback)
+    | where FileName =~ "wmic.exe"
+    | where ProcessCommandLine has_any ("/node:","/node=")
+    | where ProcessCommandLine has "process call create"
+    | extend DeviceId, Timestamp, Account = coalesce(AccountName, InitiatingProcessAccountName),
+             Cmd = ProcessCommandLine, Proc = FileName;
+
+// 2. REINFORCEMENT (The Context)
+L2_Base
+| join kind=leftouter (
+    DeviceNetworkEvents
+    | where Timestamp >= ago(lookback)
+    | where RemotePort == 135 or RemotePort between (49152 .. 65535) // RPC Ports
+    | project NetTime = Timestamp, DeviceId, RemoteIP, RemotePort
+) on DeviceId
+// *** THE FIX: Temporal Constraint ***
+| where isnull(NetTime) or abs(NetTime - Timestamp) <= TimeWindow
+| summarize 
+    HasPayloadHints = max(toint(Cmd has_any (PayloadHints))),
+    RpcDestIPs      = make_set(RemoteIP, 10),
+    RpcPorts        = make_set(RemotePort, 10),
+    HasRpcHints     = max(toint(isnotnull(NetTime)))
+    by Timestamp, DeviceId, DeviceName, Account, Proc, Cmd
+
+// 3. SCORING & DIRECTIVE
+| extend Severity = case(
+    HasPayloadHints == 1 and HasRpcHints == 1, "HIGH",
+    HasPayloadHints == 1 or  HasRpcHints == 1, "MEDIUM",
+    "LOW"
+)
+| extend HunterDirectives = case(
+    Severity == "HIGH",   "HIGH: Remote WMI exec + RPC traffic observed. Strong Lateral Movement indicator.",
+    Severity == "MEDIUM", "MEDIUM: Remote WMI exec with payload hints. Verify target /node.",
+    "LOW: WMI remote execution (Baseline). Verify legitimacy."
+)
+| project Timestamp, Severity, DeviceName, DeviceId, Account, Proc, Cmd, HasPayloadHints, HasRpcHints, RpcDestIPs, HunterDirectives
+| order by Severity desc
