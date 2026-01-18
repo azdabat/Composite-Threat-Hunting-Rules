@@ -1,0 +1,117 @@
+// ============================================================================
+// COMPOSITE HUNT (L2 / L2.5): Scheduled Task Abuse (Creation / Modification)
+// AUTHOR: Ala Dabat
+// MITRE: T1053.005 (Scheduled Task/Job: Scheduled Task)
+// DATA: DeviceProcessEvents (MDE / Sentinel)
+// ---------------------------------------------------------------------------
+// WHY COMPOSITE (Framework):
+//   Baseline Truth  : A task is created/changed (schtasks.exe /create or /change)
+//   Reinforcement   : Task action is a script engine OR points to a user-writable path
+//   Noise Control   : Suppress obvious maintenance/updater patterns and Program Files paths
+//
+// NOTES:
+//   - This is built for operating reality: tasks are common, but "who/what/where" is not.
+//   - You should tune allowlists per tenant (SCCM, OEM updaters, EDR agents).
+// ============================================================================
+
+let Lookback = 7d;
+
+// User-writable / commonly abused execution paths (reinforcement)
+let WritablePaths = dynamic([
+  "\\users\\public\\",
+  "\\programdata\\",
+  "\\windows\\temp\\",
+  "\\temp\\",
+  "\\appdata\\local\\temp\\",
+  "\\appdata\\roaming\\",
+  "\\perflogs\\"
+]);
+
+// Script/proxy engines commonly launched from task actions (reinforcement)
+let ScriptEngines = dynamic([
+  "powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe","rundll32.exe","regsvr32.exe"
+]);
+
+// Tenant tuning: common benign task creators (examples; add your own)
+let AllowInitiatingParents = dynamic([
+  "sihclient.exe",          // Windows servicing
+  "usoclient.exe",          // Windows Update
+  "trustedinstaller.exe",
+  "tiworker.exe",
+  "msiexec.exe",
+  "setuphost.exe"
+]);
+
+// Tenant tuning: common benign keywords in task cmdlines (examples; add your own)
+let AllowKeywords = dynamic([
+  "\\microsoft\\windows\\", // common built-in task paths
+  "onedrive", "teams", "edgeupdate", "googleupdate",
+  "sccm", "ccm", "intune", "defender", "microsoft update"
+]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName =~ "schtasks.exe"
+| extend Cmd = tolower(ProcessCommandLine)
+| where Cmd has_any ("/create", "/change")
+//
+// Reinforcement extraction
+//
+| extend
+    HasTaskAction = iif(Cmd has "/tr" or Cmd has " /tr ", 1, 0),
+    UsesScriptEngine = iif(Cmd has_any (ScriptEngines), 1, 0),
+    UsesWritablePath  = iif(Cmd has_any (WritablePaths), 1, 0),
+    RunsAsSystem      = iif(Cmd has_any ("/ru system"," /ru \"system\""," /ru \"nt authority\\system\"","/ru \"nt authority\\system\""), 1, 0),
+    SuspSchedule      = iif(Cmd has_any ("/sc onlogon","/sc onstart","/sc minute","/sc hourly") or Cmd has "/mo", 1, 0),
+    HiddenTaskHints   = iif(Cmd has_any ("/f","/rl highest","/it","/z"), 1, 0)
+//
+// Minimum Truth gate + reinforcement (composite)
+//   - schtasks /create|/change is baseline
+//   - must have script engine OR writable path (else too noisy)
+//
+| where UsesScriptEngine == 1 or UsesWritablePath == 1
+//
+// Noise suppression (avoid obvious benign patterns)
+//
+| where not(tolower(InitiatingProcessFileName) in~ (AllowInitiatingParents))
+| where not(Cmd has_any (AllowKeywords))
+| where not(Cmd has "\\program files\\")  // task action pointing into PF is often legit (tune if needed)
+//
+// Score (simple + explainable)
+//
+| extend RiskScore =
+      0
+    + iif(HasTaskAction == 1, 15, 0)
+    + iif(UsesScriptEngine == 1, 35, 0)
+    + iif(UsesWritablePath  == 1, 35, 0)
+    + iif(RunsAsSystem      == 1, 20, 0)
+    + iif(SuspSchedule      == 1, 15, 0)
+    + iif(HiddenTaskHints   == 1, 10, 0)
+| where RiskScore >= 40
+| extend Severity = case(
+    RiskScore >= 85, "CRITICAL",
+    RiskScore >= 65, "HIGH",
+    "MEDIUM"
+)
+| extend HunterDirective = strcat(
+    "ACTION: ", Severity, " scheduled task persistence triage | ",
+    "CONTEXT: schtasks /create|/change with ",
+      iif(UsesScriptEngine==1, "ScriptEngine", "NonScript"),
+      " + ",
+      iif(UsesWritablePath==1, "WritablePath", "NonWritablePath"),
+      iif(RunsAsSystem==1, " + SYSTEM", ""),
+      " | ",
+    "PIVOT: extract TaskName (/tn) + TaskRun (/tr). Verify owner/change ticket. ",
+    "If unapproved: inspect referenced payload, check recent downloads, and hunt for lateral movement."
+)
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    InitiatingProcessFileName,
+    FileName,
+    RiskScore,
+    Severity,
+    HunterDirective,
+    ProcessCommandLine
+| order by RiskScore desc, Timestamp desc
