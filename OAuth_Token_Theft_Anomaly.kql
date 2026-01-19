@@ -7,7 +7,7 @@
 //
 // REINFORCEMENT (Reduces Noise):
 //   - "New Country + New ASN" (Tier 1) = very low-noise indicator of stolen token/session.
-//   - "New ASN + New UA family + WeakAuth" (Tier 2) = expands coverage while limiting travel/VPN noise.
+//   - "New ASN + New UA family + WeakAuth" (Tier 2) = expands coverage while limiting travel/VPN noise. 
 //   - Requires baseline history to avoid “first ever sign-in” false positives.
 //
 // WHY COMPOSITE:
@@ -27,13 +27,13 @@
 //   - Uses set_has_element() for dynamic set membership (KQL-safe).
 // ============================================================================
 
-let TokenBaselineWindow = 30d;
+let TokenBaselineWindow = 30d; //checks 30 days for ASN + UA + Single factor authentication for divergence from the "normal baseline"
 let TokenRecentWindow   = 7d;
 let MinBaselineEvents   = 5;   // raise if your tenant is noisy
 let ScoreThresholdTier2 = 7;   // Tier 2 threshold gate
 
 // Optional: exclude known automation/service accounts if they skew UA/ASN heavily.
-// let ExcludedUsers = dynamic(["svc-automation@contoso.com"]);
+// let ExcludedUsers = dynamic(["svc-automation@contoso.com"]); //Noise suppression through known UA and ASN used via automation services 
 
 let Baseline =
 SigninLogs
@@ -44,8 +44,8 @@ SigninLogs
     Country   = tostring(LocationDetails.countryOrRegion),
     ASN       = tostring(NetworkLocationDetails.autonomousSystemNumber),
     UA        = tostring(UserAgent)
-| where isnotempty(UserPrincipalName) and isnotempty(AppId)
-| where isnotempty(Country) and isnotempty(ASN) and isnotempty(UA)
+| where isnotempty(UserPrincipalName) and isnotempty(AppId)   //Minimum truth you cannot have a session token or cookie replay without a userprinciple login or a new app ID signing in
+| where isnotempty(Country) and isnotempty(ASN) and isnotempty(UA) //we need a way to distinguish between impossible travel and anomalous activity and unusual travel is a noisey proposition
 | extend UA_Family = toupper(strcat_array(array_slice(split(UA, " "), 0, 1), ""))
 | summarize
     BaselineCount      = count(),
@@ -68,13 +68,13 @@ SigninLogs
     AuthReq   = tostring(AuthenticationRequirement)
 | where isnotempty(UserPrincipalName) and isnotempty(AppId)
 | extend UA_Family = toupper(strcat_array(array_slice(split(UA, " "), 0, 1), ""))
-| join kind=inner Baseline on UserPrincipalName, AppId
+| join kind=inner Baseline on UserPrincipalName, AppId            //this is where we create the minimum baseline and attaching it to 30 days
 // IMPORTANT: membership checks against dynamic sets must use set_has_element()
 | extend
-    IsNewCountry = iif(not(set_has_element(BaselineCountries,  Country)),    1, 0),
-    IsNewASN     = iif(not(set_has_element(BaselineASNs,       ASN)),        1, 0),
-    IsNewUA      = iif(not(set_has_element(BaselineUAFamilies, UA_Family)),  1, 0),
-    WeakAuth     = iif(AuthReq =~ "singleFactorAuthentication", 1, 0)
+    IsNewCountry = iif(not(set_has_element(BaselineCountries,  Country)),    1, 0), //set_has_element looks for divergence on three key elements this is element 1 checks if exists in 30 day baseline
+    IsNewASN     = iif(not(set_has_element(BaselineASNs,       ASN)),        1, 0), //element 2 checks if it exists in 30 day baseline
+    IsNewUA      = iif(not(set_has_element(BaselineUAFamilies, UA_Family)),  1, 0), // element 3 checks if it exists in 30 day baseline 
+    WeakAuth     = iif(AuthReq =~ "singleFactorAuthentication", 1, 0) //element 4 but this is a requirment i.e. a minimum truth baseline
 // Score: simple, explainable, interview-safe
 | extend Score =
       (IsNewCountry * 3)
