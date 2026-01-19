@@ -53,7 +53,7 @@ DeviceProcessEvents
 | where Timestamp >= ago(Lookback)
 | where FileName =~ "schtasks.exe"
 | extend Cmd = tolower(ProcessCommandLine)
-| where Cmd has_any ("/create", "/change")
+| where Cmd has_any ("/create", "/change")    // Minimum truth a user creates a scheduled task not, malicious or taht suspicious yet 
 //
 // Reinforcement extraction
 //
