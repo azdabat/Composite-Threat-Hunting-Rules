@@ -9,7 +9,13 @@
 //   Reinforcement   : Task action is a script engine OR points to a user-writable path
 //   Noise Control   : Suppress obvious maintenance/updater patterns and Program Files paths
 //   Pivot: If scheduled task runs COM to registry to launch a malicious DLL my registry persistence rule will catch it
-//
+// 1. Minimum baseline of truth is a non-negotiable withoout it there is no rule. A noisey rule is a defect in rule logic
+// The minimum baseline of truth is: schtasks.exe running /create or /change someone created a scheduled task, thousands of google updates and SCCM create these re-enforcment is required
+// Creating a shceduled task is the minim truth of the event, and not the attack.
+// 2. Convergence collapses when a scheduled task spawns a malicious process... from a user writable path!
+// Attack Truth is not Task Creation," but as "Task Creation + Dangerous Payload + Loaded from user writable path." This moves the rule from "Noise" to "Signal.
+// 3. Operational reality suppress obvious maintenance/updater patterns is a requirment for tuning out noise and convergence on truth ensures low noise to signal.
+//4. Analyst a Playbook in a String tells analysts exactly what fields matter (TaskName, TaskRun) and what to do (Verify owner). This reduces "Time to Decision." ensures operational integrity.
 // NOTES:
 //   - This is built for operating reality: tasks are common, but "who/what/where" is not.
 //   - You should tune allowlists per tenant (SCCM, OEM updaters, EDR agents).
