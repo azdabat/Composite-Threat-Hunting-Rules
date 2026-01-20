@@ -15,7 +15,14 @@
 //   Consent events are common. This hunt only becomes meaningful when the grant
 //   includes high-risk permissions and/or admin consent and/or scripted UA.
 //   This keeps it L2-usable, low-noise, and explainable.
-//
+// 1. Minimim Truth is consent grant given with high risk permissions to unknown application and new appid.
+// 2. unknown app asking for User.Read is boring. An unknown app asking for Mail.ReadWrite is a P1. By making HighRiskCount factor in blast radius
+// 3. Re-enforcement: IsSuspiciousUA (User Agent) and IsAdmin (Admin Consent) to boost the score. Increase fedelity lower noise, give analyst and org confidence. MTTR
+// 4. Re-enforcement, non standard useragent script initiator curl, python, powershell rather than normal baseline Google Chrome, Edge etc...
+// 5. i did NOT filter out Microsoft Apps. You applied a Score Penalty FOR NOT being "Safe"
+// 6. Re-enforcement to catch application spoofing through token session replay: A spoofed app named "Microsoft Teams" asks for Mail.ReadWrite (High Risk) and Directory.ReadWrite (High Risk) using a Python script (Suspicious UA).
+// Score: (20) + (20) + (12) - 20 = 32. ALERT.
+// 7. HUNTER DIRECTIVES AND CONFIDENCE: L1 analysts MAY ISSUE "Revocation" WHICH breaks things. mY directive gives clear, safe steps: "Confirm owner -> Revoke -> Rotate." Also provide the crucial pivot point: InitiatorUPN.
 // Data:
 //   - AuditLogs (required)
 //
