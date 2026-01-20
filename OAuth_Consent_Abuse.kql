@@ -24,6 +24,7 @@
 // Score: (20) + (20) + (12) - 20 = 32. ALERT.
 // 7. HUNTER DIRECTIVES AND CONFIDENCE: L1 analysts MAY ISSUE "Revocation" WHICH breaks things. mY directive gives clear, safe steps: "Confirm owner -> Revoke -> Rotate." Also provide the crucial pivot point: InitiatorUPN.
 // Data:
+// SOFT-GATING ensures we consider legitimate apps can be spoofed. Scoring confidence where minimum baseline truth is already suspicious allows us to build re-enforcement confidence, and scoring severity.
 //   - AuditLogs (required)
 //
 // MITRE:
