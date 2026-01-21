@@ -1,63 +1,77 @@
 // ============================================================================
-// COMPOSITE HUNT: WMI-A2_L2_Permanent_Subscription_Persistence (Low-noise)
+// COMPOSITE HUNT: WMI-A2_L2_Permanent_Subscription_Persistence (Composite L2)
 // Author: Ala Dabat
-// Version: 2026-01 (v3)
-// Goal: Detect likely creation/modification of WMI *permanent* event subscriptions.
-// Baseline Truth: Interaction with root\subscription + permanent class artifacts.
-// Reinforcement: Script consumer OR suspicious execution context.
-// Data: DeviceProcessEvents (required)
-// MITRE: T1546.003, T1047
-// Notes:
-//   - Register-WmiEvent is often NON-permanent; we down-weight it unless paired with root\subscription.
-//   - Tune allowlists (MgmtAgents / IT tooling) per tenant.
+// Version: 2026-01 (v2.2)
+// Philosophy: Baseline Truth (Permanent WMI artifact activity) + Reinforcement (consumer/script hints)
+// Data: DeviceProcessEvents
+// MITRE: T1546.003 (WMI Event Subscription), T1047 (WMI)
+// Ops Note:
+//   - Use Mode="SCHEDULED" with 1d (daily) or 1h (hourly) to avoid cost/timeouts.
+//   - Use Mode="HUNT" with 14d for retro sweeps.
 // ============================================================================
-let lookback = 14d;
+let Mode = "SCHEDULED"; // "SCHEDULED" or "HUNT"
+let lookback = iff(Mode == "HUNT", 14d, 1d);  // change to 1h if running hourly
 
-let WmiPermArtifacts = dynamic(["__eventfilter","__eventconsumer","__filtertoconsumerbinding"]);
-let WmiRootSub = dynamic(["root\\subscription","root/subscription"]);
-let WmiWriteTooling = dynamic(["set-wmiinstance","wmic","mofcomp.exe"]);          // more “write-ish”
-let WmiSometimesBenign = dynamic(["register-wmievent"]);                          // common benign
-let ScriptConsumers = dynamic(["activescripteventconsumer","commandlineeventconsumer"]);
-let SuspTokens = dynamic(["-enc","frombase64string","iex","downloadstring","http://","https://"]);
+let PersistTokens  = dynamic(["__eventfilter","__eventconsumer","__filtertoconsumerbinding"]);
+let PersistTooling = dynamic(["set-wmiinstance","mofcomp.exe","root\\subscription","root/subscription","register-wmievent"]);
 
-let SuspDirs = dynamic(["\\users\\public\\","\\programdata\\","\\windows\\temp\\","\\appdata\\local\\temp\\","\\downloads\\"]);
-let SuspParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe","rundll32.exe"]);
-
-let LikelyMgmtAgents = dynamic([
-  "ccmexec.exe","scepservice.exe","senseir.exe","qualysagent.exe","taniumclient.exe"
-  // add your tenant’s real list
-]);
+// Tenant tuning (placeholders)
+// - SCCM / ConfigMgr commonly: ccmexec.exe (and related tooling)
+// - Group Policy scripts sometimes: gpscript.exe
+let AllowedParents = dynamic(["ccmexec.exe","gpscript.exe"]);
+let AllowedAccounts = dynamic([]);  // e.g. service accounts used for legitimate WMI mgmt
+let AllowedDevices  = dynamic([]);  // e.g. SCCM site servers / packaging jump boxes
 
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| extend Cmd = tolower(ProcessCommandLine), Proc = tolower(FileName), Parent = tolower(InitiatingProcessFileName)
-| where Cmd has_any (WmiPermArtifacts)
-| where Cmd has_any (WmiRootSub) // key: anchor to permanent subscription namespace
+
+// Baseline Truth: activity consistent with permanent subscription artifact creation/modification
+| where ProcessCommandLine has_any (PersistTokens)
+| where ProcessCommandLine has_any (PersistTooling) or FileName =~ "mofcomp.exe"
+
+// Noise suppression (tenant tuned)
+| where not(tolower(InitiatingProcessFileName) has_any (AllowedParents))
+| where not(AccountName in~ (AllowedAccounts))
+| where not(DeviceName in~ (AllowedDevices))
+
+| extend Cmd = tostring(ProcessCommandLine), Proc = tostring(FileName), Parent = tostring(InitiatingProcessFileName)
 | extend
-    UsesWriteTooling = toint(Proc in~ (WmiWriteTooling) or Cmd has_any (WmiWriteTooling)),
-    UsesRegisterWmiEvent = toint(Cmd has_any (WmiSometimesBenign)),
-    HasScriptConsumer = toint(Cmd has_any (ScriptConsumers)),
-    HasSuspTokens = toint(Cmd has_any (SuspTokens)),
-    HasSuspDir = toint(tolower(FolderPath) has_any (SuspDirs) or Cmd has_any (SuspDirs)),
-    BadParent = toint(Parent in~ (SuspParents)),
-    LikelyAgent = toint(Parent in~ (LikelyMgmtAgents) or Proc in~ (LikelyMgmtAgents))
-| where LikelyAgent == 0 // structural suppression: remove common mgmt agents (tune list)
-| extend RiskScore =
-      0
-    + iif(UsesWriteTooling == 1, 40, 0)
-    + iif(HasScriptConsumer == 1, 35, 0)
-    + iif(HasSuspTokens == 1, 25, 0)
-    + iif(HasSuspDir == 1, 15, 0)
-    + iif(BadParent == 1, 20, 0)
-    + iif(UsesRegisterWmiEvent == 1 and UsesWriteTooling == 0, -20, 0) // down-rank common benign pattern
-| where RiskScore >= 45
-| extend Severity = case(RiskScore >= 80, "HIGH", RiskScore >= 60, "MEDIUM", "LOW")
+    HasConsumerType = toint(tolower(Cmd) has_any ("activescripteventconsumer","commandlineeventconsumer")),
+    HasScriptHint   = toint(tolower(Cmd) has_any ("vbscript","jscript","scripttext","powershell","cmd.exe","wscript","cscript")),
+    UsesRegister    = toint(tolower(Cmd) has "register-wmievent") // often benign, so treat as weaker context
+
+// Simple scoring (reinforcement ≠ trigger)
+| extend Score =
+      40
+    + (HasConsumerType * 25)
+    + (HasScriptHint   * 25)
+    + (UsesRegister    * -10)  // down-rank common benign path if it's just Register-WmiEvent-style usage
+
+| extend Severity = case(
+      Score >= 80, "HIGH",
+      Score >= 60, "MEDIUM",
+      "LOW"
+  )
+
+// De-dup to avoid repeated alerting on the same host+cmd pattern
+| summarize
+    FirstSeen=min(Timestamp),
+    LastSeen=max(Timestamp),
+    Count=count(),
+    Score=max(Score),
+    Severity=take_any(Severity),
+    SampleCmd=take_any(Cmd),
+    Parents=make_set(Parent, 5),
+    Accounts=make_set(AccountName, 5)
+  by DeviceName, Proc
+
 | extend HunterDirectives = case(
     Severity == "HIGH",
-      "ACTION: Contain/triage WMI permanent subscription. PIVOT: enumerate root\\subscription (__EventFilter/__EventConsumer/__Binding), validate consumer command/script, check creator process tree + recent outbound.",
+      "ACTION: Investigate possible WMI permanent persistence. CONTEXT: Script/Consumer hints present. PIVOT: enumerate root\\subscription + confirm consumer action + check adjacent outbound/C2.",
     Severity == "MEDIUM",
-      "ACTION: Validate if legitimate management automation. PIVOT: check initiating parent, signer, and whether consumer executes script/LOLBin; review adjacent network activity.",
-    "ACTION: Review context; tune allowlists if expected admin tooling."
+      "ACTION: Validate if legitimate management tooling. PIVOT: confirm parent process + change window; if unplanned, inspect WMI subscription objects.",
+    "ACTION: Review/tune allowlists if expected."
 )
-| project Timestamp, Severity, RiskScore, DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine, FolderPath, HunterDirectives
-| order by RiskScore desc, Timestamp desc
+
+| project FirstSeen, LastSeen, Severity, Score, DeviceName, Proc, Parents, Accounts, SampleCmd, Count, HunterDirectives
+| order by Score desc, LastSeen desc
