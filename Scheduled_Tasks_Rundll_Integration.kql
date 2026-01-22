@@ -1,8 +1,7 @@
 // ============================================================================
 // COMPOSITE HUNT (L2 / L2.5): Scheduled Task Abuse (Creation / Modification) — RUNDLL-AWARE (Hardened)
 // AUTHOR: Ala Dabat
-// UNTESTED!!!!! 
-// VERSION: 2026-01 (Composite Framework Rewrite)
+// VERSION: 2026-01 (Composite Framework Rewrite - Hardened v2)
 // MITRE: T1053.005 (Scheduled Task/Job: Scheduled Task)
 // DATA: DeviceProcessEvents (MDE / Sentinel) [+ optional follow-on pivots in other hunts]
 // ---------------------------------------------------------------------------
@@ -48,12 +47,12 @@ let WritablePaths = dynamic([
 ]);
 
 let ScriptEngines = dynamic([
-  "powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe",
-  "rundll32.exe","regsvr32.exe","wmic.exe","msbuild.exe","installutil.exe"
+  "powershell","pwsh","cmd.exe","wscript","cscript","mshta",
+  "rundll32","regsvr32","wmic","msbuild","installutil","bash","sh"
 ]);
 
-// Rundll32 truth tokens (inside /tr)
-let Rundll_ScriptProtoTokens = dynamic(["javascript:","vbscript:","mshtml,runhtmlapplication","mshtml.dll","scrobj.dll","scriptlet"]);
+// Rundll32 truth tokens (inside /tr or Cmd)
+let Rundll_ScriptProtoTokens = dynamic(["javascript:","vbscript:","mshtml","scrobj","scriptlet"]);
 let Rundll_INFProxyTokens    = dynamic(["advpack","ieadvpack","syssetup","setupapi","launchinfsection","registerocx","setupinfobjectinstallaction"]);
 let Rundll_ObfusHints        = dynamic(["progra~1","windows~1"]);
 let Rundll_ControlToken      = "control_rundll";
@@ -63,7 +62,7 @@ let Rundll_ControlToken      = "control_rundll";
 // --------------------
 let AllowInitiatingParents = dynamic([
   "sihclient.exe","usoclient.exe","trustedinstaller.exe","tiworker.exe",
-  "msiexec.exe","setuphost.exe"
+  "msiexec.exe","setuphost.exe","omadmclient.exe"
 ]);
 
 let AllowKeywords = dynamic([
@@ -86,74 +85,64 @@ DeviceProcessEvents
 //    NOTE: schtasks is messy; we handle quoted and unquoted values.
 // --------------------
 | extend
-    TaskName = coalesce(
-        extract(@"(?i)\s/tn\s+""([^""]+)""", 1, tostring(ProcessCommandLine)),
-        extract(@"(?i)\s/tn\s+([^\s]+)", 1, tostring(ProcessCommandLine)),
-        ""
-    ),
-    TaskRunRaw = coalesce(
-        extract(@"(?i)\s/tr\s+""([^""]+)""", 1, tostring(ProcessCommandLine)),
-        extract(@"(?i)\s/tr\s+([^\s]+)", 1, tostring(ProcessCommandLine)),
-        ""
-    ),
-    RunAs = coalesce(
-        extract(@"(?i)\s/ru\s+""([^""]+)""", 1, tostring(ProcessCommandLine)),
-        extract(@"(?i)\s/ru\s+([^\s]+)", 1, tostring(ProcessCommandLine)),
-        ""
-    ),
-    Schedule = coalesce(
-        extract(@"(?i)\s/sc\s+([^\s]+)", 1, tostring(ProcessCommandLine)),
-        ""
-    ),
-    Modifier = coalesce(
-        extract(@"(?i)\s/mo\s+([^\s]+)", 1, tostring(ProcessCommandLine)),
-        ""
-    )
+    TaskName = extract(@"(?i)(?:/tn\s+)(?:""([^""]+)""|([^\s]+))", 1, ProcessCommandLine),
+    TaskRunRaw = extract(@"(?i)(?:/tr\s+)(?:""([^""]+)""|([^\s]+))", 1, ProcessCommandLine),
+    RunAs = extract(@"(?i)(?:/ru\s+)(?:""([^""]+)""|([^\s]+))", 1, ProcessCommandLine),
+    Schedule = extract(@"(?i)/sc\s+([^\s]+)", 1, ProcessCommandLine),
+    Modifier = extract(@"(?i)/mo\s+([^\s]+)", 1, ProcessCommandLine),
+    UsingXML = toint(Cmd has "/xml")
 
 | extend
-    TaskRun = tostring(TaskRunRaw),
+    TaskRun = coalesce(TaskRunRaw, "XML_or_ParseFail"),
     TaskRunL = tolower(tostring(TaskRunRaw)),
     ParentProc = tolower(tostring(InitiatingProcessFileName)),
     IsCreate = toint(Cmd has "/create"),
     IsChange = toint(Cmd has "/change"),
-    HasTR = toint(isnotempty(TaskRun)),
-    RunsAsSystem = toint(RunAs has_any ("system","nt authority\\system")),
+    HasTR = toint(isnotempty(TaskRunRaw)),
+    RunsAsSystem = toint(Cmd has_any ("system","nt authority\\system")),
     SuspSchedule = toint(tolower(Schedule) has_any ("onlogon","onstart","minute","hourly") or Cmd has "/mo"),
     HiddenTaskHints = toint(Cmd has_any ("/f","/rl highest","/it","/z"))
 
 // --------------------
 // 4) Reinforcement: action danger + writable path + rundll execution-model categorisation
+//    HARDENING UPDATE: Checks Cmd primarily to prevent regex evasion on extracted fields
 // --------------------
 | extend
     UsesWritablePath = toint(TaskRunL has_any (WritablePaths) or Cmd has_any (WritablePaths)),
     UsesScriptEngine = toint(TaskRunL has_any (ScriptEngines) or Cmd has_any (ScriptEngines)),
 
-    // Rundll-aware (only meaningful if TaskRun contains rundll32)
-    TR_IsRundll = toint(TaskRunL has "rundll32.exe"),
-    TR_Rundll_ScriptProto = toint(TR_IsRundll == 1 and TaskRunL has_any (Rundll_ScriptProtoTokens)),
-    TR_Rundll_Remote = toint(TR_IsRundll == 1 and ((TaskRunL startswith "\\\\") or (TaskRunL has_any ("http://","https://","ftp://")))),
-    TR_Rundll_INFProxy = toint(TR_IsRundll == 1 and TaskRunL has_any (Rundll_INFProxyTokens)),
-    TR_Rundll_ControlMisuse = toint(TR_IsRundll == 1 and TaskRunL has Rundll_ControlToken and TaskRunL !has ".cpl"),
-    TR_Rundll_Ordinal = toint(TR_IsRundll == 1 and TaskRun matches regex @",\s*#[0-9]+"),
-    TR_Rundll_PathObfus = toint(TR_IsRundll == 1 and (TaskRunL has_any (Rundll_ObfusHints) or TaskRun matches regex @"\.\.\\"))
+    // Rundll-aware (Check Cmd to ensure detection even if /tr extraction fails)
+    TR_IsRundll = toint(Cmd has "rundll32"),
+    TR_Rundll_ScriptProto = toint(Cmd has "rundll32" and Cmd has_any (Rundll_ScriptProtoTokens)),
+    TR_Rundll_Remote = toint(Cmd has "rundll32" and ((Cmd has "\\\\") or (Cmd has_any ("http://","https://","ftp://")))),
+    TR_Rundll_INFProxy = toint(Cmd has "rundll32" and Cmd has_any (Rundll_INFProxyTokens)),
+    TR_Rundll_ControlMisuse = toint(Cmd has "rundll32" and Cmd has Rundll_ControlToken and Cmd !has ".cpl"),
+    TR_Rundll_Ordinal = toint(Cmd has "rundll32" and Cmd matches regex @",\s*#[0-9]+"),
+    TR_Rundll_PathObfus = toint(Cmd has "rundll32" and (Cmd has_any (Rundll_ObfusHints) or Cmd matches regex @"\.\.\\"))
 
 // --------------------
 // 5) Minimum Truth + Composite gating (avoid "task creation noise")
-//    Must have: dangerous action OR writable path OR rundll truth category.
+//    Must have: dangerous action OR writable path OR rundll truth category OR XML import.
 // --------------------
-| where UsesScriptEngine == 1 or UsesWritablePath == 1 or TR_IsRundll == 1
+| where UsesScriptEngine == 1 
+     or UsesWritablePath == 1 
+     or TR_IsRundll == 1
+     or UsingXML == 1
 
 // --------------------
 // 6) Noise suppression (tenant-specific)
 // --------------------
 | where not(ParentProc in~ (AllowInitiatingParents))
 | where not(Cmd has_any (AllowKeywords))
-| where not(TaskRunL has "\\program files\\")  // keep: reduces updater noise; tune if needed
+// FIXED BLINDSPOT: Only exclude Program Files if it is NOT a script engine or rundll
+| where not(Cmd has "\\program files\\" and UsesScriptEngine == 0 and TR_IsRundll == 0)
 
 // --------------------
 // 7) Category (attack-model classification)
 // --------------------
 | extend TaskActionCategory = case(
+    UsingXML == 1 and UsesWritablePath == 1, "Task_XML_Import_From_WritablePath",
+    UsingXML == 1, "Task_XML_Import_Unknown_Action",
     TR_Rundll_ScriptProto == 1, "Rundll32_ScriptProtocol_Handler_Abuse",
     TR_Rundll_Remote      == 1, "Rundll32_Remote_UNC_WebDAV_URL_Load",
     TR_Rundll_INFProxy    == 1, "Rundll32_INF_ProxyExec_LaunchINFSection",
@@ -185,6 +174,8 @@ DeviceProcessEvents
         TaskActionCategory == "Rundll32_INF_ProxyExec_LaunchINFSection", 48,
         TaskActionCategory == "Rundll32_ControlRunDLL_Misuse", 35,
         TaskActionCategory == "Rundll32_Ordinal_or_Path_Obfuscation", 35,
+        TaskActionCategory == "Task_XML_Import_From_WritablePath", 45,
+        TaskActionCategory == "Task_XML_Import_Unknown_Action", 20,
         TaskActionCategory == "Rundll32_Generic_Task_Action", 25,
         TaskActionCategory == "Task_ScriptEngine_From_WritablePath", 40,
         TaskActionCategory == "Task_ScriptEngine_Action", 28,
@@ -198,7 +189,8 @@ DeviceProcessEvents
         + iif(UsesScriptEngine == 1, 20, 0)
         + iif(RunsAsSystem == 1, 18, 0)
         + iif(SuspSchedule == 1, 12, 0)
-        + iif(HiddenTaskHints == 1, 10, 0),
+        + iif(HiddenTaskHints == 1, 10, 0)
+        + iif(UsingXML == 1, 10, 0),
 
     RiskScore = tolong(BaseScore + CategoryScore + ContextScore),
 
@@ -231,6 +223,7 @@ DeviceProcessEvents
                " | Schedule=", iif(isempty(Schedule), "<unknown>", Schedule),
                iif(isempty(Modifier), "", strcat(" | /mo ", Modifier))),
         strcat("[ACTION] Category=", TaskActionCategory,
+               " | XML=", tostring(UsingXML),
                " | UsesWritablePath=", tostring(UsesWritablePath),
                " | UsesScriptEngine=", tostring(UsesScriptEngine),
                " | SYSTEM=", tostring(RunsAsSystem),
