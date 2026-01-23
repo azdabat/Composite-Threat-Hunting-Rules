@@ -1,0 +1,50 @@
+// ============================================================================
+// COMPOSITE HUNT (L2 / Core+): PowerShell Download Cradle / Stager (Intent-Gated)
+// STATUS: PRODUCTION HARDENED (Tenant tuning required)
+// AUTHOR: Ala Dabat
+//
+// WHY (Framework):
+//   Minimum Truth  : PowerShell performs web download intent (iwr/irm/webclient/downloadstring) with external URL
+//   Reinforcement  : Obfuscation / execution (IEX, Enc, base64) + suspicious parent + writable path targeting
+//   Noise Control  : Suppress common deployment/agent patterns; suppress RFC1918/internal domains
+//
+// ATTACK CHAIN:
+//   Initial access → PS cradle fetch → optional in-memory exec → stage/persist
+//
+// MITRE:
+//   TA0002 Execution, TA0011 C2 (Ingress Tool Transfer), TA0005 Defense Evasion
+// ============================================================================
+let lookback = 7d;
+let Threshold = 60;
+
+let ShellProcs = dynamic(["powershell.exe","pwsh.exe"]);
+let SuspiciousParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let SuspiciousDirs    = dynamic(["\\Users\\Public","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp"]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (ShellProcs)
+| where not(ProcessCommandLine has_any ("ccmcache","AmazonSSMAgent","AzureADConnect"))
+| where not(ProcessCommandLine matches regex @"(?i)://(10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.|.*\.corp\.|.*\.local|.*\.internal)")
+| extend Cmd = tolower(tostring(ProcessCommandLine))
+| extend
+    HasExternalUrl = Cmd matches regex @"(?i)http[s]?://",
+    HasIngressIntent = Cmd has_any ("invoke-webrequest","iwr","invoke-restmethod","irm","downloadstring","downloadfile","new-object net.webclient","system.net.webclient"),
+    HasScriptExec = Cmd has_any ("iex","invoke-expression","-enc","frombase64string"),
+    BadParent = tolower(tostring(InitiatingProcessFileName)) in~ (SuspiciousParents),
+    BadDir = Cmd has_any (tolower(SuspiciousDirs))
+| where HasExternalUrl and HasIngressIntent   // Minimum Truth (intent + external URL)
+| extend RiskScore =
+      45
+    + iif(HasScriptExec, 30, 0)
+    + iif(BadParent, 25, 0)
+    + iif(BadDir, 10, 0)
+| where RiskScore >= Threshold
+| extend Severity = case(RiskScore >= 90, "CRITICAL", RiskScore >= 75, "HIGH", "MEDIUM")
+| extend Hunter_Directive = strcat(
+    "ACTION: ", Severity, " PowerShell download cradle/stager triage | ",
+    "CONTEXT: External URL + web request intent (ExecHints=", tostring(HasScriptExec), ", BadParent=", tostring(BadParent), ") | ",
+    "PIVOT: extract URL(s), inspect decoded content if -enc/base64, check child processes, file writes in Temp/Public, and scope same cmdline hash across estate."
+)
+| project Timestamp, DeviceName, AccountName, FileName, RiskScore, Severity, Hunter_Directive, ProcessCommandLine, InitiatingProcessFileName
+| order by RiskScore desc, Timestamp desc
