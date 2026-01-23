@@ -1,0 +1,140 @@
+// ============================================================================
+// COMPOSITE HUNT (COREPLUS / L2.5): Ingress Tool Transfer — Native LOLBins (SAFE Reinforcement)
+// AUTHOR: Ala Dabat
+// STATUS: PRODUCTION HARDENED (tenant tuning expected)
+// MITRE: TA0011 (Command & Control) | T1105 (Ingress Tool Transfer)
+//
+// WHY COMPOSITE (Framework):
+//   Minimum Truth    : Native transfer LOLBin executes with EXTERNAL transfer intent (URL/external IP OR tool transfer flags)
+//   Reinforcement T1 : Near file-write evidence from the SAME initiating process (proves ingress produced an artifact)
+//   Reinforcement T1 : Near child-process cascade from the SAME initiating process (download → execute pattern)
+//   Reinforcement T2 : Suspicious parent (Office/script engines), writable-path targeting, suspicious file-type targeting
+//   Noise Control    : Known updater/deployment strings + internal/RFC1918 suppression + certutil verify/dump suppression
+//
+// SAFE REINFORCEMENT PRINCIPLES (what we do NOT do):
+//   - No global prevalence joins (separate ecosystem)
+//   - No beacon/C2 periodicity logic (separate ecosystem)
+//   - No injection/memory API logic (separate ecosystem)
+//
+// KNOWN BLIND SPOTS (By Design):
+//   - Fileless in-memory fetch/exec (covered by PowerShell / script execution hunts)
+//   - Internal lateral staging (covered by SMB/lateral movement ecosystems)
+// ============================================================================
+let lookback = 7d;
+let Threshold = 70;
+let NearFileWindow = 10m;
+let NearChildWindow = 10m;
+
+let TransferLOLBins = dynamic(["certutil.exe","bitsadmin.exe","curl.exe","wget.exe","ftp.exe","tftp.exe"]);
+let SuspiciousParents = dynamic(["winword.exe","excel.exe","powerpnt.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let WritablePathHints = dynamic(["\\users\\public\\","\\programdata\\","\\windows\\temp\\","\\temp\\","\\downloads\\","\\appdata\\local\\temp\\","\\appdata\\roaming\\"]);
+let SuspTargetExts = dynamic([".ps1",".vbs",".vbe",".js",".jse",".sct",".hta",".dll",".exe",".msi",".zip",".7z",".rar",".iso",".img",".cab",".dat",".bin"]);
+
+let AllowStrings = dynamic([
+  "ccmcache",                       // SCCM/MECM
+  "windows/system32/mpcmdrun.exe",  // Defender updates
+  "amazonssmagent",                 // AWS SSM Agent
+  "azureadconnect"                  // AAD Connect
+]);
+
+let Base =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (TransferLOLBins)
+| extend Cmd = tolower(tostring(ProcessCommandLine))
+| extend Parent = tolower(tostring(InitiatingProcessFileName))
+| where not(Cmd has_any (AllowStrings))
+| where not(Cmd matches regex @"(?i)://(10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.|.*\.corp\.|.*\.local|.*\.internal)")
+| where not(FileName =~ "certutil.exe" and Cmd has_any ("-verify","-dump","-error"))
+| extend
+    HasExternalRef = Cmd matches regex @"(?i)(http[s]?://|ftp://|\b\d{1,3}(\.\d{1,3}){3}\b)",
+    HasIngressFlags = Cmd has_any ("-urlcache","-split","/transfer","/addfile","--remote-name","--output"," -o "," -O "),
+    BadParent = Parent in~ (SuspiciousParents),
+    TargetsWritable = Cmd has_any (WritablePathHints),
+    TargetsSuspExt = Cmd has_any (SuspTargetExts)
+| where HasExternalRef or HasIngressFlags   // Minimum Truth: external transfer intent
+| project
+    Timestamp, DeviceId, DeviceName, AccountName,
+    FileName, ProcessId, InitiatingProcessFileName, InitiatingProcessId,
+    ProcessCommandLine,
+    HasExternalRef, HasIngressFlags, BadParent, TargetsWritable, TargetsSuspExt;
+
+// Reinforcement T1: file artifacts written by SAME initiating process (tight, safe join)
+let FileArtifacts =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileRenamed","FileModified")
+| extend Path = tolower(tostring(FolderPath))
+| extend FullPath = strcat(Path, "\\", tolower(tostring(FileName)))
+| extend IsWritable = Path has_any (WritablePathHints)
+| extend IsSuspExt = FullPath has_any (SuspTargetExts)
+| where IsWritable or IsSuspExt
+| project DeviceId, InitiatingProcessId, FileTime=Timestamp, DroppedFile=FullPath, IsWritable, IsSuspExt;
+
+// Reinforcement T1: child-process cascade from SAME initiating process (download → execute)
+let ChildCascade =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| extend Child = tolower(tostring(FileName))
+| where Child !in~ ("conhost.exe","werfault.exe") // tiny noise trim
+| project DeviceId, InitiatingProcessId, ChildTime=Timestamp, ChildProc=Child, ChildCmd=tostring(ProcessCommandLine);
+
+Base
+| join kind=leftouter FileArtifacts on DeviceId, InitiatingProcessId
+| extend FileNear = isnotempty(DroppedFile) and (abs(datetime_diff("minute", Timestamp, FileTime)) <= toint(NearFileWindow/1m))
+| summarize
+    Timestamp=max(Timestamp),
+    DeviceName=any(DeviceName),
+    AccountName=any(AccountName),
+    FileName=any(FileName),
+    ProcessCommandLine=any(ProcessCommandLine),
+    InitiatingProcessFileName=any(InitiatingProcessFileName),
+    ProcessId=any(ProcessId),
+    HasExternalRef=any(HasExternalRef),
+    HasIngressFlags=any(HasIngressFlags),
+    BadParent=any(BadParent),
+    TargetsWritable=any(TargetsWritable),
+    TargetsSuspExt=any(TargetsSuspExt),
+    FileNear=max(toint(FileNear)),
+    DroppedFiles=make_set(DroppedFile, 10)
+  by DeviceId, InitiatingProcessId
+| join kind=leftouter (
+    ChildCascade
+    | summarize
+        ChildNear=max(toint(abs(datetime_diff("minute", Timestamp, ChildTime)) <= toint(NearChildWindow/1m))),
+        ChildProcs=make_set(ChildProc, 10),
+        ChildCmds=make_set(ChildCmd, 10)
+      by DeviceId, InitiatingProcessId
+) on DeviceId, InitiatingProcessId
+| extend
+    BaseScore = 60,
+    ContextScore =
+        (15 * iff(HasExternalRef, 1, 0)) +
+        (15 * iff(HasIngressFlags, 1, 0)) +
+        (25 * iff(BadParent, 1, 0)) +
+        (10 * iff(TargetsWritable, 1, 0)) +
+        (10 * iff(TargetsSuspExt, 1, 0)),
+    ReinforceScore =
+        (25 * iff(FileNear == 1, 1, 0)) +
+        (25 * iff(ChildNear == 1, 1, 0)),
+    RiskScore = tolong(BaseScore + ContextScore + ReinforceScore),
+    Severity = case(RiskScore >= 95, "CRITICAL", RiskScore >= 80, "HIGH", "MEDIUM")
+| where RiskScore >= Threshold
+| extend HuntingDirectives = pack_array(
+    strcat("[MIN_TRUTH] ", FileName, " executed with external transfer intent (URL/IP/flags)."),
+    strcat("[SCORE] ", tostring(RiskScore), " | Severity=", Severity,
+           " | Context(BadParent/TargetsWritable/TargetsExt) + Reinforce(FileNear/ChildNear)."),
+    strcat("[PROCESS] Parent=", tostring(InitiatingProcessFileName)),
+    strcat("[CMD] ", substring(tostring(ProcessCommandLine), 0, 240)),
+    iif(FileNear==1, strcat("[FILE] Near artifact(s): ", tostring(DroppedFiles)), "[FILE] No near writable/suspicious artifact observed (may still be in-memory or elsewhere)."),
+    iif(ChildNear==1, strcat("[CASCADE] Near child proc(s): ", tostring(ChildProcs)), "[CASCADE] No near child execution observed."),
+    "[NEXT] If unapproved: inspect fetched URL(s), validate dropped file signer/hash, check child proc lineage, and scope same InitiatingProcessId chain on host."
+)
+| project
+    Timestamp, DeviceName, AccountName,
+    FileName, RiskScore, Severity,
+    InitiatingProcessFileName, ProcessCommandLine,
+    FileNear, DroppedFiles,
+    ChildNear, ChildProcs,
+    HuntingDirectives
+| order by RiskScore desc, Timestamp desc
