@@ -5,11 +5,11 @@
 // MITRE: TA0002 (Execution) + TA0011 (C2) | T1105 (Ingress Tool Transfer)
 //
 // PATCH NOTES (WHY THIS VERSION):
-//   FIX (KQL Scope) : No left-side Timestamp references inside join subqueries.
-//   SAFE REINFORCE  : Near file-write and near child-cascade are computed POST-JOIN, tight window.
+//   FIX (KQL Scope) : Removed "where" filters post-join to prevent implicit inner-join data loss.
+//   SAFE REINFORCE  : Uses "extend IsMatch" + "iff" logic to safely flag artifacts without dropping the parent row.
 //
 // WHY COMPOSITE (Framework):
-//   Minimum Truth    : PowerShell has external URL + explicit download intent (iwr/irm/webclient/download*)
+//   Minimum Truth     : PowerShell has external URL + explicit download intent (iwr/irm/webclient/download*)
 //   Reinforcement T1 : Exec intent (iex / -enc / base64 / invoke-expression)
 //   Reinforcement T1 : Near file-write evidence (PS-write) within 10m (payload staged)
 //   Reinforcement T1 : Near child-process cascade from PS within 10m (download → execute)
@@ -72,17 +72,20 @@ DeviceProcessEvents
 | where ChildProc !in~ ("conhost.exe","werfault.exe")
 | project DeviceId, ParentProcessId=InitiatingProcessId, ChildTime=Timestamp, ChildProc, ChildCmd=tostring(ProcessCommandLine);
 
-// 4) Join & compute windows POST-JOIN
+// 4) Join & compute windows POST-JOIN (FIXED LOGIC)
 Base
 | join kind=leftouter (FileArtifacts) on DeviceId
-| where WriterProcessId == ProcessId
-  and abs(datetime_diff("minute", Timestamp, FileTime)) <= NearWindowMins
+// FIX: Calculate match logic in a column, do NOT filter rows out
+| extend IsFileMatch = (WriterProcessId == ProcessId and abs(datetime_diff("minute", Timestamp, FileTime)) <= NearWindowMins)
 | summarize
-    FileNear = max(1),
-    DroppedFiles = make_set(DroppedFile, 10),
+    FileNear = max(toint(IsFileMatch)),
+    // Only capture the file path if it was a match; otherwise empty string (avoids pollution)
+    DroppedFiles = make_set(iff(IsFileMatch, DroppedFile, ""), 10),
+    // Pass-through columns
     Timestamp = max(Timestamp),
     DeviceName = any(DeviceName),
     AccountName = any(AccountName),
+    FileName = any(FileName),
     Cmd = any(Cmd),
     Parent = any(Parent),
     ProcessId = any(ProcessId),
@@ -93,15 +96,18 @@ Base
     TargetsSuspExt = any(TargetsSuspExt),
     LongEncoded = any(LongEncoded)
   by DeviceId, ProcessId, InitiatingProcessId
+
 | join kind=leftouter (ChildCascade) on DeviceId
-| where ParentProcessId == ProcessId
-  and abs(datetime_diff("minute", Timestamp, ChildTime)) <= NearWindowMins
+// FIX: Calculate child match logic
+| extend IsChildMatch = (ParentProcessId == ProcessId and abs(datetime_diff("minute", Timestamp, ChildTime)) <= NearWindowMins)
 | summarize
-    ChildNear = max(1),
-    ChildProcs = make_set(ChildProc, 10),
+    ChildNear = max(toint(IsChildMatch)),
+    ChildProcs = make_set(iff(IsChildMatch, ChildProc, ""), 10),
+    // Pass-through columns again
     Timestamp = max(Timestamp),
     DeviceName = any(DeviceName),
     AccountName = any(AccountName),
+    FileName = any(FileName),
     Cmd = any(Cmd),
     Parent = any(Parent),
     HasExecIntent = any(HasExecIntent),
@@ -131,7 +137,7 @@ Base
 
 // 6) Output
 | extend HuntingDirectives = pack_array(
-    "[MIN_TRUTH] PowerShell web-ingress with external URL + download intent.",
+    strcat("[MIN_TRUTH] ", FileName, " executed with external transfer intent."),
     strcat("[SCORE] ", tostring(RiskScore), " | Severity=", Severity,
            " | ExecIntent=", tostring(HasExecIntent),
            " | FileNear=", tostring(FileNear),
