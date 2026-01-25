@@ -1,59 +1,75 @@
 // ============================================================================
-// COMPOSITE HUNT (L3): Registry_Persistence_Background_Service_TaskCache
+// COMPOSITE HUNT (L3): Registry_Persistence_Userland_Autoruns
 // Author: Ala Dabat
 //
 // TRUTH DOMAIN: DeviceRegistryEvents (+ context joins)
 // MINIMUM TRUTH:
-//   RegistryValueSet under Services OR Schedule TaskCache (Tree/Tasks).
+//   A RegistryValueSet occurs in classic userland autorun/logon trigger keys.
 //
-// WHY THIS EXISTS (Blind Spot Fix):
-//   Advanced frameworks can create Scheduled Tasks via COM/PowerShell APIs
-//   without executing schtasks.exe. Task creation still materializes in TaskCache.
+// ECOSYSTEM:
+//   - Run / RunOnce / Policies Explorer Run
+//   - Active Setup
+//   - Winlogon Shell/Userinit
 //
 // MITRE:
-//   T1543.003 Windows Service
-//   T1053.005 Scheduled Task
+//   T1547.001 Registry Run Keys / Startup Folder
+//   T1547.014 Active Setup
+//   T1547.004 Winlogon Helper / Shell
 //
-// REINFORCEMENT / CONVERGENCE:
-//   - Dangerous primitives in ImagePath/Task actions
-//   - User-writable targets
-//   - Large blobs (encoded/script payload stashes)
-//   - Untrusted or rare writer processes
+// REINFORCEMENT (Confidence, not dependency):
+//   - Dangerous primitive in value data (powershell/cmd/wscript/mshta/rundll32/regsvr32)
+//   - Obfuscation/encoded/base64 patterns
+//   - Network indicators (URL/domain/IP)
+//   - User-writable execution target
+//   - Rare writer binary (org prevalence)
+//   - Untrusted signer/company OR suspicious initiator chain
 //
 // NOISE SUPPRESSION:
-//   - Safe vendor + safe path suppressed unless danger/base64/net/writable/blob
-//   - Installer/updater initiators suppressed unless high-risk indicators
+//   - Safe path + safe vendor keywords suppressed unless dangerous primitives exist
+//   - Trusted installer/updater initiators suppressed unless high-risk indicators exist
 // ============================================================================
 
 let lookback = 14d;
 
+// ---- Tenant tunables
 let TrustedPublishers = dynamic(["Microsoft Corporation","Microsoft Windows","Google LLC","Mozilla Corporation"]);
 let TrustedInitiators = dynamic(["msiexec.exe","trustedinstaller.exe","sppsvc.exe","intunemanagementextension.exe","updateinstaller.exe"]);
 
-let BackgroundKeys = dynamic([
-  @"system\currentcontrolset\services",
-  @"software\microsoft\windows nt\currentversion\schedule\taskcache\tree",
-  @"software\microsoft\windows nt\currentversion\schedule\taskcache\tasks"
+// ---- Userland persistence keys (logon triggers)
+let UserlandKeys = dynamic([
+  @"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+  @"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+  @"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+  @"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+  @"HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
+  @"HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
+  @"HKLM\SOFTWARE\Microsoft\Active Setup\Installed Components",
+  @"HKCU\SOFTWARE\Microsoft\Active Setup\Installed Components",
+  @"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Userinit",
+  @"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell",
+  @"HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell"
 ]);
 
+// ---- Indicators
 let UserWritableRx   = @"(?i)^[a-z]:\\(users|public|programdata|temp|downloads|appdata)\\";
 let Base64ChunkedRx  = @"(?:[A-Za-z0-9+/]{20,}={0,2})(?:\s+[A-Za-z0-9+/]{20,}={0,2})+";
 let IPv4Rx           = @"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b";
 let DomainRx         = @"\b([a-z0-9][a-z0-9-]{1,62}\.)+[a-z]{2,}\b";
 let UrlRx            = @"https?://[^\s'""<>]+";
 
+// ---- Dangerous primitives (convergence)
 let DangerTokens = dynamic([
-  "powershell","pwsh","cmd.exe","mshta","rundll32","regsvr32","wscript","cscript",
-  "certutil","bitsadmin","curl",
-  "-enc","-encodedcommand","frombase64string",
-  "http:","https:"
+  "powershell","pwsh","-enc","-encodedcommand","frombase64string",
+  "iex(","invoke-expression","downloadstring","invoke-webrequest","invoke-restmethod","start-bitstransfer",
+  "cmd.exe","wscript.exe","cscript.exe","mshta","rundll32","regsvr32",
+  "schtasks","sc.exe","wmic","curl","certutil","bitsadmin"
 ]);
 
+// ---- Safe noise anchors (suppress unless danger/obfuscation/userwritable)
 let SafePathAnchors = dynamic([@"c:\program files", @"c:\program files (x86)", @"c:\windows\system32", @"c:\windows\syswow64"]);
-let SafeVendorKeywords = dynamic(["windows update","microsoft","google","edge","mozilla","firefox","onedrive","teams","intel","nvidia","amd","realtek","adobe","citrix"]);
+let SafeVendorKeywords = dynamic(["google","chrome","edge","mozilla","firefox","onedrive","teams","slack","zoom","intel","nvidia","amd","realtek","adobe","citrix"]);
 
-let PayloadSizeThreshold = 500;
-
+// ---- Org prevalence for writer binary (rarity = reinforcement, not trigger)
 let OrgPrevalence =
   DeviceFileEvents
   | where Timestamp >= ago(30d)
@@ -63,10 +79,12 @@ let Raw =
   DeviceRegistryEvents
   | where Timestamp >= ago(lookback)
   | where ActionType == "RegistryValueSet"
-  | extend RK = tolower(tostring(RegistryKey)),
-           RVN = tolower(tostring(RegistryValueName)),
-           RVD = tolower(tostring(RegistryValueData))
-  | where RK has_any (BackgroundKeys);
+  | where RegistryKey has_any (UserlandKeys)
+  | extend
+      ValueData = tostring(RegistryValueData),
+      ValueName = tostring(RegistryValueName),
+      RKLower   = tolower(RegistryKey),
+      VDLower   = tolower(ValueData);
 
 let WithProc =
   Raw
@@ -76,7 +94,9 @@ let WithProc =
       | project
           DeviceId,
           InitiatingProcessId,
+          ProcTime = Timestamp,
           WriterFile = tostring(InitiatingProcessFileName),
+          WriterPath = tostring(InitiatingProcessFolderPath),
           WriterCL   = tostring(InitiatingProcessCommandLine),
           WriterSHA  = tostring(InitiatingProcessSHA256),
           WriterSigner = tostring(InitiatingProcessSigner),
@@ -86,6 +106,8 @@ let WithProc =
   | extend
       WriterFileL = tolower(coalesce(WriterFile,"")),
       WriterCLL   = tolower(coalesce(WriterCL,"")),
+      WriterSignerL = tolower(coalesce(WriterSigner,"")),
+      WriterCompanyL = tolower(coalesce(WriterCompany,"")),
       WriterTrustedPublisher = toint(WriterCompany in (TrustedPublishers) or WriterSigner in (TrustedPublishers)),
       WriterTrustedInitiator = toint(WriterFileL in (TrustedInitiators));
 
@@ -95,47 +117,37 @@ let Enriched =
   | extend WriterDeviceCount = coalesce(WriterDeviceCount, 0),
            WriterIsRare = toint(WriterDeviceCount <= 2);
 
+// ---- Convergence signals
 Enriched
 | extend
-    IsService = toint(RK has "system\\currentcontrolset\\services"),
-    IsTaskCache = toint(RK has "schedule\\taskcache"),
-    // Service indicator: ImagePath changes are most meaningful
-    ServiceImagePathWrite = toint(IsService==1 and (RVN == "imagepath" or RVN has "imagepath")),
-    // Convergence
-    HasDanger = toint(RVD has_any (DangerTokens) or WriterCLL has_any (DangerTokens)),
-    HasBase64 = toint(RVD matches regex Base64ChunkedRx or WriterCLL matches regex Base64ChunkedRx),
-    HasNet    = toint(RVD matches regex UrlRx or RVD matches regex IPv4Rx or RVD matches regex DomainRx),
-    PointsWritable = toint(RVD matches regex UserWritableRx),
-    IsLargeBlob = toint(strlen(RVD) > PayloadSizeThreshold),
-    IsSafePath = toint(RVD has_any (SafePathAnchors)),
-    IsSafeVendor = toint(RVD has_any (SafeVendorKeywords) or RVN has_any (SafeVendorKeywords)),
-    UntrustedWriter = toint(WriterTrustedPublisher == 0);
+    HasDanger     = toint(VDLower has_any (DangerTokens) or WriterCLL has_any (DangerTokens)),
+    HasBase64     = toint(VDLower matches regex Base64ChunkedRx or WriterCLL matches regex Base64ChunkedRx),
+    HasNet        = toint(VDLower matches regex UrlRx or VDLower matches regex IPv4Rx or VDLower matches regex DomainRx),
+    PointsWritable= toint(VDLower matches regex UserWritableRx),
+    SuspExtRef    = toint(VDLower matches regex @"(?i)\.(exe|dll|ps1|vbs|js|jse|bat|cmd|scr)\b"),
+    IsSafePath    = toint(VDLower has_any (SafePathAnchors)),
+    IsSafeVendor  = toint(VDLower has_any (SafeVendorKeywords) or tolower(ValueName) has_any (SafeVendorKeywords)),
+    UntrustedWriter = toint(WriterTrustedPublisher == 0),
+    HighRiskWriter = toint(WriterIsRare == 1 and UntrustedWriter == 1);
 
-// ---- Minimum truth enforcement
-| where (IsService==1 or IsTaskCache==1)
+// ---- Noise suppression rule:
+// drop safe vendor+safe path unless danger/base64/net/writable exists
+| where not( IsSafePath == 1 and IsSafeVendor == 1 and HasDanger == 0 and HasBase64 == 0 and HasNet == 0 and PointsWritable == 0 )
 
-// ---- Service gating: only alert on meaningful service persistence writes
-| where (IsTaskCache==1) or (ServiceImagePathWrite==1) or (HasDanger==1) or (PointsWritable==1) or (IsLargeBlob==1)
-
-// ---- Noise suppression: safe vendor+safe path suppressed unless strong indicators
-| where not(IsSafePath==1 and IsSafeVendor==1 and HasDanger==0 and HasBase64==0 and HasNet==0 and PointsWritable==0 and IsLargeBlob==0)
-
-// ---- Trusted initiator suppression unless strong indicators
-| where not(WriterTrustedInitiator==1 and (HasDanger + HasBase64 + HasNet + PointsWritable + IsLargeBlob) == 0)
+// ---- Trusted initiator suppression:
+// drop trusted installers unless high-risk indicators exist
+| where not( WriterTrustedInitiator == 1 and (HasDanger + HasBase64 + HasNet + PointsWritable) == 0 )
 
 | extend
-    BaseScore = 55,
-    Score_TaskCache = 25 * IsTaskCache,
-    Score_Service   = 20 * ServiceImagePathWrite,
-    Score_Danger    = 25 * HasDanger,
-    Score_Base64    = 20 * HasBase64,
-    Score_Net       = 10 * HasNet,
-    Score_Writable  = 15 * PointsWritable,
-    Score_Blob      = 25 * IsLargeBlob,
+    BaseScore = 40, // minimum truth: userland persistence key write
+    Score_Danger = 25 * HasDanger,
+    Score_Base64 = 20 * HasBase64,
+    Score_Net    = 15 * HasNet,
+    Score_Writable = 15 * PointsWritable,
     Score_UntrustedWriter = 10 * UntrustedWriter,
     Score_RareWriter = 10 * WriterIsRare,
-    RiskScore = BaseScore + Score_TaskCache + Score_Service + Score_Danger + Score_Base64 + Score_Net + Score_Writable + Score_Blob + Score_UntrustedWriter + Score_RareWriter,
-    RiskLevel = case(RiskScore >= 120, "CRITICAL", RiskScore >= 90, "HIGH", RiskScore >= 70, "MEDIUM", "LOW")
+    RiskScore = BaseScore + Score_Danger + Score_Base64 + Score_Net + Score_Writable + Score_UntrustedWriter + Score_RareWriter,
+    RiskLevel = case(RiskScore >= 95, "CRITICAL", RiskScore >= 75, "HIGH", RiskScore >= 55, "MEDIUM", "LOW")
 
 | where RiskLevel in ("MEDIUM","HIGH","CRITICAL")
 
@@ -144,25 +156,22 @@ Enriched
     DeviceName,
     AccountName = coalesce(WriterUser, tostring(AccountName)),
     RegistryKey,
-    RegistryValueName,
-    RegistryValueData,
-    PersistenceClass = case(IsTaskCache==1,"TaskCache(SilentTask)", ServiceImagePathWrite==1,"Service(ImagePath)", "Background(Other)"),
+    RegistryValueName = ValueName,
+    RegistryValueData = ValueData,
     WriterProcess = WriterFile,
     WriterCommandLine = WriterCL,
     WriterCompany,
     WriterSigner,
     WriterSHA,
     WriterDeviceCount,
-    HasDanger, HasBase64, HasNet, PointsWritable, IsLargeBlob,
+    HasDanger, HasBase64, HasNet, PointsWritable,
     RiskScore, RiskLevel
 
 | extend HunterDirective = case(
-    RiskLevel=="CRITICAL" and PersistenceClass startswith "TaskCache",
-      "CRITICAL: Silent Scheduled Task persistence via TaskCache (API/COM). Pull task definition (TaskCache GUID/Tree), isolate if unauthorized, scope for same task name/GUID across fleet.",
-    RiskLevel=="CRITICAL" and PersistenceClass startswith "Service",
-      "CRITICAL: Service persistence set (ImagePath) with strong indicators. Validate service name + binary path, check signer, collect binary, scope other hosts for same ImagePath.",
-    RiskLevel=="HIGH",
-      "HIGH: Background persistence registry artifact. Pivot to writer ancestry, recent file drops at referenced path, and search fleet for same RegistryValueData / WriterSHA.",
-    "MEDIUM: Background persistence signal. Validate if approved updater/agent; if not, escalate and scope."
+    RiskLevel == "CRITICAL",
+      "CRITICAL: Autorun/logon persistence set with dangerous/obfuscated payload. Validate writer process legitimacy, collect autorun triage, check child processes and outbound traffic. Scope for same WriterSHA and same value data across fleet.",
+    RiskLevel == "HIGH",
+      "HIGH: Userland persistence set with strong suspicious indicators. Inspect target path, verify signer, pivot to DeviceProcessEvents for writer ancestry, and search for same value data on other hosts.",
+    "MEDIUM: Userland persistence changed. Validate if approved software; if not, pivot into writer chain + recent file drops in target path."
 )
 | order by RiskScore desc, Timestamp desc
