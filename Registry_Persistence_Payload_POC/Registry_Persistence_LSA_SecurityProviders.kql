@@ -1,0 +1,133 @@
+// ============================================================================
+// COMPOSITE HUNT (L3): Registry_Persistence_LSA_SecurityProviders
+// Author: Ala Dabat
+//
+// TRUTH DOMAIN: DeviceRegistryEvents (+ writer context)
+// MINIMUM TRUTH:
+//   RegistryValueSet under Control\\Lsa affecting security providers / SSP.
+//
+// MITRE:
+//   T1547.009 LSA / SSP (Operationally grouped)
+//   (Often aligns with credential theft enablement / logon interception)
+//
+// REINFORCEMENT:
+//   - DLL reference in user-writable paths
+//   - Untrusted/rare writer process
+//
+// NOISE SUPPRESSION:
+//   - Suppress Microsoft-signed changes unless writable/rare/untrusted indicators
+// ============================================================================
+
+let lookback = 14d;
+
+let TrustedPublishers = dynamic(["Microsoft Corporation","Microsoft Windows"]);
+let TrustedInitiators = dynamic(["msiexec.exe","trustedinstaller.exe","sppsvc.exe"]);
+
+let LsaKeys = dynamic([
+  @"hk lm\system\currentcontrolset\control\lsa",
+  @"hklm\system\currentcontrolset\control\lsa"
+]);
+
+let LsaValueIndicators = dynamic([
+  "security packages",
+  "notification packages",
+  "authentication packages",
+  "osconfig",
+  "lsaextensionconfigdll",
+  "ssp",
+  "dll"
+]);
+
+let UserWritableRx   = @"(?i)^[a-z]:\\(users|public|programdata|temp|downloads|appdata)\\";
+let SafePathAnchors = dynamic([@"c:\windows\system32", @"c:\windows\syswow64"]);
+let PayloadExtRx = @"(?i)\.(dll|ocx)\b";
+
+let OrgPrevalence =
+  DeviceFileEvents
+  | where Timestamp >= ago(30d)
+  | summarize WriterDeviceCount = dcount(DeviceId) by SHA256;
+
+let Raw =
+  DeviceRegistryEvents
+  | where Timestamp >= ago(lookback)
+  | where ActionType == "RegistryValueSet"
+  | extend RK = tolower(tostring(RegistryKey)),
+           RVN = tolower(tostring(RegistryValueName)),
+           RVD = tolower(tostring(RegistryValueData))
+  | where RK has_any (LsaKeys)
+  | where RVN has_any (LsaValueIndicators) or RVD has_any (LsaValueIndicators);
+
+let WithProc =
+  Raw
+  | join kind=leftouter (
+      DeviceProcessEvents
+      | where Timestamp >= ago(lookback)
+      | project
+          DeviceId,
+          InitiatingProcessId,
+          WriterFile = tostring(InitiatingProcessFileName),
+          WriterCL   = tostring(InitiatingProcessCommandLine),
+          WriterSHA  = tostring(InitiatingProcessSHA256),
+          WriterSigner = tostring(InitiatingProcessSigner),
+          WriterCompany = tostring(InitiatingProcessVersionInfoCompanyName),
+          WriterUser = tostring(InitiatingProcessAccountName)
+    ) on DeviceId, InitiatingProcessId
+  | extend
+      WriterFileL = tolower(coalesce(WriterFile,"")),
+      WriterTrustedPublisher = toint(WriterCompany in (TrustedPublishers) or WriterSigner in (TrustedPublishers)),
+      WriterTrustedInitiator = toint(WriterFileL in (TrustedInitiators));
+
+let Enriched =
+  WithProc
+  | join kind=leftouter OrgPrevalence on $left.WriterSHA == $right.SHA256
+  | extend WriterDeviceCount = coalesce(WriterDeviceCount, 0),
+           WriterIsRare = toint(WriterDeviceCount <= 2);
+
+Enriched
+| extend
+    HasDllRef = toint(RVD matches regex PayloadExtRx),
+    PointsWritable = toint(RVD matches regex UserWritableRx),
+    IsSafeSystemPath = toint(RVD has_any (SafePathAnchors)),
+    UntrustedWriter = toint(WriterTrustedPublisher == 0);
+
+// ---- Noise suppression:
+// suppress trusted Microsoft changes unless they point outside safe system paths or writer is rare/untrusted
+| where not(WriterTrustedPublisher==1 and IsSafeSystemPath==1 and PointsWritable==0 and WriterIsRare==0)
+
+// ---- Trusted initiator suppression unless high-risk indicators
+| where not(WriterTrustedInitiator==1 and PointsWritable==0 and WriterIsRare==0 and UntrustedWriter==0)
+
+| extend
+    BaseScore = 70, // LSA persistence is inherently high impact
+    Score_Writable = 25 * PointsWritable,
+    Score_UntrustedWriter = 20 * UntrustedWriter,
+    Score_RareWriter = 15 * WriterIsRare,
+    Score_NonSystemPath = 20 * toint(IsSafeSystemPath==0 and HasDllRef==1),
+    RiskScore = BaseScore + Score_Writable + Score_UntrustedWriter + Score_RareWriter + Score_NonSystemPath,
+    RiskLevel = case(RiskScore >= 120, "CRITICAL", RiskScore >= 95, "HIGH", "MEDIUM")
+
+| project
+    Timestamp,
+    DeviceName,
+    AccountName = coalesce(WriterUser, tostring(AccountName)),
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    WriterProcess = WriterFile,
+    WriterCommandLine = WriterCL,
+    WriterCompany,
+    WriterSigner,
+    WriterSHA,
+    WriterDeviceCount,
+    PointsWritable,
+    RiskScore,
+    RiskLevel
+
+| extend HunterDirective = case(
+    RiskLevel=="CRITICAL",
+      "CRITICAL: LSA/SSP persistence modified. Treat as credential-compromise enabling. Validate provider DLL location + signer, isolate host if unauthorized, collect evidence and scope fleet for same RegistryValueData.",
+    RiskLevel=="HIGH",
+      "HIGH: LSA persistence change. Confirm change control. If unknown, escalate immediately and scope for logon anomalies / credential dumping follow-on.",
+    "MEDIUM: LSA-related change. Validate against baseline and change approvals."
+)
+| order by RiskScore desc, Timestamp desc
