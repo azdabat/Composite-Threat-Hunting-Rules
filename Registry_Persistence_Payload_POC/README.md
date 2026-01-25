@@ -281,6 +281,7 @@ These composites become dramatically stronger when paired with adjacent sensors:
 ## Mermaid Diagrams (with interpretation)
 
 ### 01 — Userland Autoruns (Branch A)
+
 ```mermaid
 flowchart TD
   A[Attacker drops launcher or script] --> B[Registry write: Run/RunOnce/Winlogon/ActiveSetup]
@@ -292,6 +293,8 @@ flowchart TD
 ```
 Interpretation: Registry is the trigger, but the real signal is convergence: writable target + obfuscation + network primitives + rare writer.
 
+### 02 — Hijack / Interception (Branch B)
+
 ```mermaid
 flowchart TD
   A[Drop DLL/scriptlet payload] --> B[Registry write: COM/IFEO/AppInit/handler]
@@ -301,4 +304,72 @@ flowchart TD
   E --> F[Privilege / persistence expansion]
 
 ```
+Interpretation: This is stealth by design. The registry write may be the only “setup” event. The next observable is usually module load.
+
+### 04 — LSA / SSP (Branch D)
+
+```mermaid
+flowchart TD
+  A[Operator has admin] --> B[Registry write: Service ImagePath OR TaskCache Tree/Tasks]
+  B --> C[Service start OR Task trigger]
+  C --> D[Payload executes as SYSTEM]
+  D --> E[C2 / ransomware staging / lateral movement]
+
+```
+Interpretation: TaskCache is the silent scheduled task truth source. If you only watch schtasks.exe, you miss this entire lane.
+
+### 04 — LSA / SSP (Branch D)
+
+```mermaid
+  A[System-level access] --> B[Registry write: Control\\Lsa provider lists]
+  B --> C[Authentication events occur]
+  C --> D[Provider DLL loads in logon pipeline]
+  D --> E[Credential interception / escalation]
+  E --> F[Lateral movement]
+```
+Interpretation: Few events, huge impact. Treat as “break-glass” priority if unapproved.
+
+### 05 — Registry Payload Stash (Branch E)
+
+```mermaid
+flowchart TD
+  A[Payload encoded] --> B[Registry value set: large blob / base64]
+  B --> C[Trigger created: Run key OR Task/service OR WMI]
+  C --> D[Decode + execute fileless]
+  D --> E[C2 + module loads + follow-on persistence]
+```
+
+### Implementation Logic (how the composites enforce fidelity)
+
+# Minimum Truth (hard gate)
+
+- The correct registry ecosystem must be touched
+- The rule does not “guess” technique from weak text matches alone
+
+# Reinforcement (scoring)
+
+- dangerous primitives / encoded / network indicators
+- user-writable target paths
+
+# rarity (org prevalence)
+
+- untrusted signer/company
+- Convergence (noise suppression)
+- safe vendor + safe system path suppressed unless attacker primitives appear
+- installer/updater writers suppressed unless reinforced by strong indicators
+
+This is the critical concept: we don’t deny reality because it’s common.
+We lower priority when common, and raise it when multiple indicators converge.
+
+## How to use this as a Venn system (operational workflow)
+
+Run all 5 composites daily in hunt mode (MEDIUM+)
+
+1) When one fires, immediately pivot to:
+2) its siblings (overlap map above)
+3) execution confirmation (process + module load)
+4) network confirmation (new dest / rare domains)
+5) Promote only the highest-impact composites to alerting first:
+
+04 (LSA), 03 (TaskCache/Services), then 02 (Hijacks)
 
