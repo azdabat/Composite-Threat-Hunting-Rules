@@ -9,7 +9,7 @@
 
 # Threat Hunting Philosophy & Detection Design
 
-**Author:** Ala Dabat - This is a framework and a methadology I myself have created from hard earned trial and error.
+**Author:** Ala Dabat - This is a framework and a methadology I myself have created from hard earned trial and error. </br>
 **Focus:** Practical, adversary-informed threat hunting for real SOC environments  
 **Audience:** L2 / L2.5 Threat Hunters, Detection Engineers, Security Leads  
 
