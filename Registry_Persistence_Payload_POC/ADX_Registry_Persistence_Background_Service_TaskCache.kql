@@ -1,0 +1,76 @@
+// ============================================================================
+// COMPOSITE HUNT (L3): Registry_Persistence_Background_Service_TaskCache
+// FINAL REFACTORED BUILD: Logic & Syntax Hardened
+// Tested: WORKS!
+// ============================================================================
+
+let lookback = 3650d; // Coverage for historic lab dataset
+
+// --- VIRTUAL MAPPING HARNESS (The Translator) ---
+let DeviceRegistryEvents = RawAPT29
+| extend Data = Data
+| where toint(Data.EventID) in (12, 13, 14)
+| project 
+    Timestamp = todatetime(Data.EventTime),
+    DeviceId = tostring(Data.Computer),
+    DeviceName = tostring(Data.Hostname),
+    RegistryKey = tostring(Data.TargetObject), 
+    RegistryValueData = tostring(Data.Details),
+    RegistryValueName = tostring(Data.RegistryValueName),
+    InitiatingProcessId = tostring(toint(Data.ProcessId));
+
+let DeviceProcessEvents = RawAPT29 
+| extend Data = Data 
+| where toint(Data.EventID) == 1
+| project 
+    DeviceId=tostring(Data.Computer),
+    InitiatingProcessId=tostring(toint(Data.ProcessId)), 
+    WriterFile = tostring(Data.Image), 
+    WriterCL = tostring(Data.CommandLine), 
+    WriterSHA = tostring(Data.Hashes),
+    WriterSigner = tostring(Data.Signer), 
+    WriterCompany = tostring(Data.Company),
+    WriterUser = tostring(Data.User);
+
+// --- RULE LOGIC ---
+let TrustedPublishers = dynamic(["Microsoft Corporation","Microsoft Windows","Google LLC","Mozilla Corporation"]);
+let BackgroundKeys = dynamic(["system\\currentcontrolset\\services", "schedule\\taskcache", "currentversion\\debug"]);
+let DangerTokens = dynamic(["powershell","pwsh","cmd.exe","-enc","iex","frombase64string"]);
+let SafePathAnchors = dynamic([@"c:\program files", @"c:\windows\system32"]);
+
+// 1. Join and Identify (Minimum Truth)
+DeviceRegistryEvents
+| join kind=leftouter (DeviceProcessEvents) on DeviceId, InitiatingProcessId
+| extend 
+    RK = tolower(RegistryKey),
+    RVD = tolower(RegistryValueData),
+    RVN = tolower(RegistryValueName),
+    WriterCLL = tolower(coalesce(WriterCL, ""))
+| extend
+    IsService = toint(RK has "system\\currentcontrolset\\services"),
+    IsTaskCache = toint(RK has "schedule\\taskcache"),
+    IsEmpireStash = toint(RK has "currentversion\\debug"),
+    HasDanger = toint(RVD has_any (DangerTokens) or WriterCLL has_any (DangerTokens)),
+    IsLargeBlob = toint(strlen(RVD) > 100),
+    IsSafePath = toint(RVD has_any (SafePathAnchors)),
+    UntrustedWriter = toint(not(WriterCompany in (TrustedPublishers) or WriterSigner in (TrustedPublishers)))
+
+// 2. Minimum Truth & Gating
+| where IsService == 1 or IsTaskCache == 1 or IsEmpireStash == 1
+| where HasDanger == 1 or IsLargeBlob == 1 or IsEmpireStash == 1 or (IsService == 1 and RVN == "imagepath")
+
+// 3. Scoring (FIXED: BaseScore defined in one extend, used in the next)
+| extend BaseScore = 50
+| extend RiskScore = BaseScore + (30 * IsEmpireStash) + (20 * IsTaskCache) + (30 * HasDanger) + (20 * IsLargeBlob) + (10 * UntrustedWriter)
+| extend RiskLevel = case(RiskScore >= 110, "CRITICAL", RiskScore >= 80, "HIGH", "MEDIUM")
+
+// 4. Output & Directive
+| project 
+    Timestamp, DeviceName, AccountName = WriterUser, 
+    PersistenceClass = case(IsEmpireStash == 1, "Empire(DebugStash)", IsTaskCache == 1, "TaskCache(SilentTask)", "Service"),
+    RegistryKey, RegistryValueData, WriterFile, WriterCL, RiskScore, RiskLevel
+| extend HunterDirective = case(
+    RiskLevel == "CRITICAL", "CRITICAL: Empire stager or Silent Task found. Decode the RegistryValueData and isolate host.",
+    "HIGH: Unusual background persistence. Triage writer process and registry payload."
+)
+| order by RiskScore desc
