@@ -313,3 +313,516 @@ This ensures:
 - Targeted attacks stand out without brittle logic
 
 Rarity strengthens detection — it never replaces understanding.
+
+---
+
+## Organisational Prevalence (Used Correctly)
+
+Organisational prevalence is one of the most misunderstood concepts in threat detection.
+
+Many SOCs apply prevalence incorrectly as a blunt filter:
+
+- “If it’s common, ignore it.”
+- “If it’s rare, alert on it.”
+
+This repository does **not** use prevalence that way.
+
+---
+
+### Core Principle
+
+> **Prevalence is not a detection trigger.**  
+> It is a *reinforcement and prioritisation amplifier* applied only after attack truth exists.
+
+If the **Minimum Truth** is not satisfied, prevalence is irrelevant.
+
+If the **Minimum Truth *is* satisfied**, prevalence helps determine urgency, scope, and analyst focus.
+
+---
+
+## Why Prevalence Exists in This Framework
+
+Prevalence answers one operational question:
+
+> **How normal is this behaviour in *this* organisation?**
+
+Attack techniques do not exist in a vacuum.
+
+The same command can be:
+
+- benign in one environment  
+- catastrophic in another  
+
+Prevalence allows detection logic to remain behavioural, while still adapting to SOC reality.
+
+---
+
+## When Prevalence Should Be Applied
+
+Prevalence is used only in three safe, SOC-real ways:
+
+---
+
+### 1. Behavioural Rarity (After Truth)
+
+**Question:**  
+How many endpoints exhibit this exact behaviour?
+
+Example behaviours:
+
+- PowerShell staging with suspicious parent  
+- Registry persistence pointing to a user-writable path  
+- Confirmed DLL sideload chain  
+
+If only **1–2 devices** show this behaviour:
+
+- likely targeted intrusion  
+- deserves escalation  
+
+If **200 devices** show it:
+
+- may be tooling, deployment, or admin automation  
+
+Prevalence helps prioritise — not suppress.
+
+---
+
+### 2. Actor / Parent Context Prevalence
+
+**Question:**  
+Who normally performs this action here?
+
+Example:
+
+- `rundll32.exe` launched by `winword.exe`
+- Scheduled task created by a normal user account
+- LSASS access by a non-security process
+
+The binary may be common.
+
+The **actor and execution context** may not be.
+
+This is where prevalence becomes true reinforcement.
+
+---
+
+### 3. Burst / Radius Prevalence
+
+**Question:**  
+How fast and how widely did this appear?
+
+- Single host → targeted persistence  
+- Multiple hosts in minutes → lateral movement or automation  
+- Domain-wide spread → ransomware precursor  
+
+Prevalence here becomes an incident-shaping signal.
+
+---
+
+## What Prevalence Is *Not* Used For
+
+This methodology explicitly avoids dangerous prevalence misuse:
+
+- ❌ Rarity is never a standalone alert condition  
+- ❌ Common ≠ safe  
+- ❌ Rare ≠ malicious  
+- ❌ High-risk truths are never suppressed  
+
+Example:
+
+- LSASS access is always surfaced  
+- OAuth illicit consent is always surfaced  
+- Silent scheduled task persistence is always surfaced  
+
+Regardless of prevalence.
+
+---
+
+## Simple Example (Clear as Day)
+
+### Scenario: Scheduled Task Persistence
+
+**Minimum Truth (Attack Exists):**
+
+A task is registered that launches PowerShell from a suspicious location:
+
+```kql
+RegistryValueData has "powershell"
+and RegistryValueData has "\\users\\public\\"
+---
+```
+## Organisational Prevalence (Used Correctly)
+
+Organisational prevalence is one of the most misunderstood concepts in threat detection.
+
+Many SOCs apply prevalence incorrectly as a blunt filter:
+
+- “If it’s common, ignore it.”
+- “If it’s rare, alert on it.”
+
+This repository does **not** use prevalence that way.
+
+---
+
+### Core Principle
+
+> **Prevalence is not a detection trigger.**  
+> It is a *reinforcement and prioritisation amplifier* applied only after attack truth exists.
+
+If the **Minimum Truth** is not satisfied, prevalence is irrelevant.
+
+If the **Minimum Truth *is* satisfied**, prevalence helps determine urgency, scope, and analyst focus.
+
+---
+
+## Why Prevalence Exists in This Framework
+
+Prevalence answers one operational question:
+
+> **How normal is this behaviour in *this* organisation?**
+
+Attack techniques do not exist in a vacuum.
+
+The same command can be:
+
+- benign in one environment  
+- catastrophic in another  
+
+Prevalence allows detection logic to remain behavioural, while still adapting to SOC reality.
+
+---
+
+## When Prevalence Should Be Applied
+
+Prevalence is used only in three safe, SOC-real ways:
+
+---
+
+### 1. Behavioural Rarity (After Truth)
+
+**Question:**  
+How many endpoints exhibit this exact behaviour?
+
+Example behaviours:
+
+- PowerShell staging with suspicious parent  
+- Registry persistence pointing to a user-writable path  
+- Confirmed DLL sideload chain  
+
+If only **1–2 devices** show this behaviour:
+
+- likely targeted intrusion  
+- deserves escalation  
+
+If **200 devices** show it:
+
+- may be tooling, deployment, or admin automation  
+
+Prevalence helps prioritise — not suppress.
+
+---
+
+### 2. Actor / Parent Context Prevalence
+
+**Question:**  
+Who normally performs this action here?
+
+Example:
+
+- `rundll32.exe` launched by `winword.exe`
+- Scheduled task created by a normal user account
+- LSASS access by a non-security process
+
+The binary may be common.
+
+The **actor and execution context** may not be.
+
+This is where prevalence becomes true reinforcement.
+
+---
+
+### 3. Burst / Radius Prevalence
+
+**Question:**  
+How fast and how widely did this appear?
+
+- Single host → targeted persistence  
+- Multiple hosts in minutes → lateral movement or automation  
+- Domain-wide spread → ransomware precursor  
+
+Prevalence here becomes an incident-shaping signal.
+
+---
+
+## What Prevalence Is *Not* Used For
+
+This methodology explicitly avoids dangerous prevalence misuse:
+
+- ❌ Rarity is never a standalone alert condition  
+- ❌ Common ≠ safe  
+- ❌ Rare ≠ malicious  
+- ❌ High-risk truths are never suppressed  
+
+Example:
+
+- LSASS access is always surfaced  
+- OAuth illicit consent is always surfaced  
+- Silent scheduled task persistence is always surfaced  
+
+Regardless of prevalence.
+
+---
+
+## Simple Example (Clear as Day)
+
+### Scenario: Scheduled Task Persistence
+
+**Minimum Truth (Attack Exists):**
+
+A task is registered that launches PowerShell from a suspicious location:
+
+```kql
+RegistryValueData has "powershell"
+and RegistryValueData has "\\users\\public\\"
+```
+
+- That is already persistence.
+- Now prevalence is applied after this truth.
+
+
+## Organisational Prevalence Reinforcement
+
+```kql
+| summarize DeviceCount = dcount(DeviceId) by TaskFingerprint
+| extend IsRare = DeviceCount <= 2
+```
+
+Interpretation:
+
+a) If this persistence appears on 1 device → likely intrusion
+b) If it appears on 300 devices → likely software deployment or misconfigured IT script
+c) The detection does not disappear.
+d) The response priority changes.
+e) Detection Engineering Rule
+
+**Prevalence decides how fast we respond — not whether we respond.**
+
+This ensures:
+
+1) High-risk attack truths are never hidden
+2) Analysts are not flooded with background noise
+3) Targeted tradecraft stands out naturally
+
+**Composite hunts remain operationally grounded**
+
+- Prevalence strengthens detection.
+- It never replaces understanding.
+
+# Summary
+
+Minimum Truth defines the attack.
+Reinforcement increases confidence.
+Prevalence scales triage.
+
+---
+
+## Correlation vs. Ghost Chains (When Joins Become Fragile)
+
+Correlation is one of the most powerful tools in behavioural detection.
+
+It is also one of the easiest ways to destroy signal quality.
+
+Most SOCs do not fail because they lack correlation.
+
+They fail because they correlate *everything*.
+
+This framework treats correlation as a scalpel, not a net.
+
+---
+
+## Core Principle
+
+> **Correlation is only valid when the attack cannot exist without multiple linked events.**
+
+If the technique is already true from one event stream,  
+forcing joins creates noise, brittleness, and false narratives.
+
+---
+
+## What Is a “Ghost Chain”?
+
+A **Ghost Chain** is when a detection query stitches together unrelated activity
+into a fake kill-chain story.
+
+This happens when:
+
+- events are common background noise  
+- time windows are arbitrary  
+- joins are used to “make it look advanced”  
+- the attacker does not actually need all stages  
+
+The result is:
+
+- high severity alerts  
+- low analyst trust  
+- broken triage  
+- missed real attacks hiding nearby  
+
+---
+
+## Why Ghost Chains Are Dangerous
+
+Correlation introduces **dependency**:
+
+- If one telemetry source is missing → detection fails  
+- If events happen outside the window → detection fails  
+- If normal activity overlaps → false chain forms  
+
+This is why monolithic “kill-chain mega rules” collapse in production.
+
+---
+
+## The Framework Rule
+
+> **The Detection Rule is the sensor.  
+> The Incident is the narrative.**
+
+We do not force one query to tell the whole story.
+
+We deploy clean sensors, then correlate at the case/incident level.
+
+---
+
+## When Correlation IS Required (True Composite Truth)
+
+Correlation is mandatory when:
+
+> No single event proves the technique.
+
+### Example: DLL Sideloading
+
+A DLL drop alone is benign.  
+A DLL load alone is benign.  
+
+The attack is only true when both occur together.
+
+```mermaid
+flowchart LR
+    A[DLL written to user-writable path] --> C{Time Correlation}
+    B[Signed binary loads DLL from same path] --> C
+    C --> D[High-Confidence Sideload Attack]
+```
+
+## When Correlation Is NOT Required (Ghost Risk)
+
+**Example: Registry Persistence**
+
+If a registry Run key is set to:
+
+```
+powershell.exe -enc <payload>
+```
+
+
+That is already persistence.
+
+You do not need to join it with:
+- network events
+- unrelated PowerShell execution
+- scheduled task execution
+- lateral movement
+
+**Those may happen later, but they are not required for truth.**
+
+Forcing them creates ghost chains.
+
+Simple Example (Clear as Day)
+❌ Bad Correlation (Ghost Chain)
+// Registry persistence
+RegistryValueSet
+| join NetworkConnection
+| join ProcessInjection
+| where all within 10 minutes
+
+
+Why this fails:
+
+- persistence may be set today
+- execution may happen tomorrow
+- network traffic may be unrelated
+- injection may never occur
+
+This produces fake kill-chain certainty.
+
+✅ Correct Architecture (Truth First)
+
+## Composite Rule 1: Persistence Sensor
+```kql
+DeviceRegistryEvents
+| where RegistryKey has "\\Run"
+| where RegistryValueData has "powershell"
+```
+
+
+Truth: persistence exists.
+
+Composite Rule 2: Runtime Loader Sensor
+
+```kql
+DeviceEvents
+| where ActionType == "PowerShellScriptBlock"
+| where AdditionalFields has "VirtualAlloc"
+```
+Truth: in-memory execution intent exists.
+
+
+##Composite Rule 3: Silent Task Sensor
+
+```kql
+DeviceRegistryEvents
+| where RegistryKey has "\\Schedule\\TaskCache"
+| where RegistryValueData has "-enc"#
+```
+
+Truth: task persistence exists.
+
+Incident-Level Correlation (Narrative Layer)
+
+Now Sentinel/MDE correlates:
+a) same device
+b) same user
+c) same timeframe
+d) multiple truths firing
+
+This builds the attack story correctly.
+
+## Operational Rule of Thumb
+
+Correlate inside a rule only when:
+
+-the technique cannot exist without both events
+- the telemetry sources are stable
+- the join reduces ambiguity, not increases complexity
+
+Split into sibling composites when:
+
+1) the truth surface changes
+2) the noise domain changes
+3) the attacker method is optional
+4) the timing may vary
+
+# Summary
+
+Correlation is not sophistication.
+Correlation is dependency.
+
+Use it only when:
+
+- The attack truth structurally requires convergence.
+
+Otherwise:
+
+- detect the truth
+- reinforce confidence
+- correlate at the incident layer
+- This prevents ghost chains and keeps hunts operational.
