@@ -209,7 +209,7 @@ If the logic must jump across **different execution mediums**, **schemas**, or *
 
 ---
 
-## 📌 Cousin Rules & Attack Ecosystem Coverage
+##  Cousin Rules & Attack Ecosystem Coverage
 
 Part of this framework’s power is the **Cousin Rule Concept**:
 
@@ -231,7 +231,7 @@ This table maps your composites to ecosystems and their cousins, with MITRE tech
 
 ---
 
-## 🗂 Ecosystem Table — Composites + Cousins (Roadmap)
+## Ecosystem Table — Composites + Cousins (Roadmap)
 
 | Ecosystem | Primary Composite | MITRE Technique | Cousin Composite (Planned/POC) | MITRE | Notes |
 |-----------|------------------|------------------|-------------------------------|-------|-------|
@@ -249,7 +249,7 @@ This table maps your composites to ecosystems and their cousins, with MITRE tech
 
 ---
 
-## 🧠 Framework Logic Behind Cousin Pairing
+## Framework Logic Behind Cousin Pairing
 
 The cousin concept is not just “another rule.” It is based on these principles:
 
