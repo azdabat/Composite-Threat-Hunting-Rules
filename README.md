@@ -120,36 +120,81 @@ The attack is only true when **both occur together**.
 
 ## Composite Threat Hunt Portfolio
 
-This repository is organised around **Composite Hunts** covering the most critical attack surfaces across endpoint, identity, and cloud environments.
 
-### Implemented & Active Composite Rules
+##  Tier-1 Baseline Pack (Enterprise Mandatory Ecosystems)
 
-| Attack Surface | Composite Hunt | MITRE | Why It Matters |
-|---------------|---------------|-------|----------------|
-| **Credential Access** | **LSASS Access / Dump Attempts** | T1003.001 | Core SOC expectation; high signal, low noise |
-| **Credential Access** | **NTDS.dit / AD Database Access** | T1003.003 | Domain compromise precursor |
-| **Credential Access** | **Kerberoasting (Weak Encryption)** | T1558.003 | Detects RC4 / 0x17 downgrade abuse |
-| **Persistence** | **WMI Event Subscription & Consumer** | T1546.003 | Fileless persistence via `scrcons.exe` |
-| **Defense Evasion** | **LOLBin Proxy Execution** | T1218 | `rundll32`, `regsvr32`, `mshta` abuse |
-| **Defense Evasion** | **DLL Sideloading (Minimal Chain)** | T1574.002 | Correlation only where structurally required |
-| **Lateral Movement** | **SMB / Named Pipe Execution** | T1021.002 | PsExec-style behaviour |
-| **Privilege Escalation** | **Account Manipulation (User / Group Changes)** | T1098 | Persistence, audit-critical |
-| **Exfiltration Prep** | **Archive + Staging (Smash & Grab)** | T1560 | Data staging before exfiltration |
-| **Cloud Identity** | **OAuth Illicit App Consent** | T1528 | Cloud persistence & data access |
+These are the **minimum required behavioural ecosystems** for any regulated enterprise (finance, insurance, gov).
+
+> Always-on coverage. High-value truths. SOC-safe baselines.
+
+| Ecosystem | Minimum Truth Sensor (Baseline) | Composite Hunt Built | Reinforcement Tuned | Atomic Validated | Maturity |
+|----------|--------------------------------|----------------------|---------------------|------------------|----------|
+| **PowerShell Execution & Abuse** | Script execution + encoded/runtime intent | ✅ Yes | ⚠️ Partial | ⚠️ In Progress | MED |
+| **Registry Autoruns (Run/RunOnce)** | RegistryValueSet on logon trigger keys | ✅ Yes | ✅ Strong | ✅ Tested | HIGH |
+| **Scheduled Tasks (CLI Creation)** | `schtasks.exe /create` process truth | ✅ Yes | ✅ Strong | ✅ Tested | HIGH |
+| **Scheduled Tasks (Silent TaskCache)** | TaskCache persistence without schtasks.exe | ✅ Yes | ⚠️ Needs Noise Calibration | ⚠️ In Progress | MED |
+| **Service Persistence (ImagePath)** | Service registry ImagePath modification | ⚠️ Partial | ❌ Not Tuned | ❌ Not Yet | LOW |
+| **Credential Access (LSASS Surface)** | LSASS access/dump behavioural truth | ✅ Yes | ⚠️ Partial | ⚠️ In Progress | MED |
+| **NTDS / SAM Extraction** | Hive/NTDS interaction truth | ✅ Yes | ⚠️ Partial | ❌ Not Yet | MED |
+| **LOLBins Proxy Execution Core** | Signed binary misuse surface | ✅ Yes | ⚠️ Needs Baselines | ❌ Not Yet | MED |
+| **Cloud Identity Persistence (OAuth Consent)** | High-risk scope grant baseline truth | ✅ Yes | ✅ Strong | ⚠️ Tenant Validation Needed | HIGH |
 
 ---
 
-### Planned Composite Additions (Roadmap)
+##  Tier-2 Composite Correlation Pack (Senior Threat Hunting Layer)
 
-These will follow the same reductive → composite → reinforcement model:
+Tier-2 introduces:
 
-| Attack Surface | Planned Hunt | MITRE | Rationale |
-|---------------|-------------|-------|-----------|
-| Persistence | Service Creation / Modification Abuse | T1543.003 | High attacker ROI, low noise |
-| Impact | Shadow Copy Deletion | T1490 | Ransomware precursor |
-| Persistence | Scheduled Task Abuse (User Context) | T1053.005 | Common execution & persistence |
-| Credential Access | SAM / Registry Hive Dump Attempts | T1003.002 | Complements LSASS coverage |
-| Cloud Activity | OAuth Token Abuse / Graph API Misuse | T1528 | Post-consent cloud exploitation |
+- Multi-surface joins  
+- Prevalence reinforcement  
+- Kill-chain convergence  
+- Noise suppression through context  
+
+These are **SOC-safe composites** built on Tier-1 truths.
+
+| Ecosystem | Minimum Truth Anchor | Composite Reinforcement Layer | Status | Maturity |
+|----------|----------------------|------------------------------|--------|----------|
+| **Registry Hijacks (IFEO/COM/AppInit)** | Execution interception registry truth | Writable DLL + rare writer + untrusted signer | ⚠️ Partial | MED |
+| **WMI Persistence + Execution** | Subscription + anomalous consumer truth | Parent lineage break + script consumer scoring | ✅ Built | HIGH |
+| **Lateral Movement (SMB Service Exec / PsExec)** | Remote service creation truth | File drop + inbound 445 + rare service binary | ⚠️ Partial | MED |
+| **Defense Evasion (Signed LOLBin Chains)** | Trusted parent → LOLBin baseline | Injection + ghost module + beacon reinforcement | ⚠️ POC → Composite | MED |
+| **Session / Token Misuse (Post-Consent)** | Token replay baseline truth | ASN+UA divergence + weak auth reinforcement | ✅ Built | HIGH |
+| **Ingress Tool Transfer** | Writable staging drop truth | Followed by execution + outbound comms | ⚠️ In Progress | MED |
+| **Shadow Copy Destruction (Ransomware Prep)** | vssadmin/wmic delete truth | Multi-tool convergence scoring | ❌ Missing | LOW |
+| **Archive Staging + Exfil Prep** | 7z/rar bulk staging truth | Large volume + outbound correlation | ❌ Missing | LOW |
+
+---
+
+##  Tier-3 Research & Novel Threat Ecosystems (POC + Emerging Tradecraft)
+
+Tier-3 covers:
+
+- Emerging malware ecosystems  
+- Patch-resistant persistence chains  
+- Novel attacker innovation  
+
+These are not always-on detections yet — they are **attack research sensors**.
+
+| Threat Ecosystem | Research Truth Anchor | Status | Notes |
+|-----------------|----------------------|--------|------|
+| **React2Shell / IIS Exploit Chains** | Web process → CLR abuse → injection | ✅ Modelled | Requires telemetry hardening |
+| **EtherRAT / Blockchain C2** | RPC beaconing + low-prevalence infra | ✅ Documented | Network correlation expansion needed |
+| **SilverFox / ValleyRAT BYOVD** | Signed loader → sideload → driver load truth | ⚠️ Advanced Composite | Needs DriverLoadEvent validation |
+| **Pulsar RAT Injection + Tasks** | Trusted parent → LOLBin → memory exec | 🟡 Parked POC | Awaiting confirmed ecosystem truth |
+| **Kernel Driver Abuse (BYOVD)** | Driver service creation + load event | ⚠️ Partial | High impact, tuning required |
+| **Supply Chain Behaviour Modelling** | Signed update → anomaly divergence | ✅ Threat Modelled | Tier-2 rule ownership pending |
+
+---
+
+#  Repository Architecture Alignment
+
+This ecosystem model maps directly into the GitHub structure:
+
+| Repository | Role in Framework |
+|-----------|------------------|
+| **Production-READY-Composite-Threat-Hunting-Rules** | Tier-1/Tier-2 deployable composites |
+| **Attack-Ecosystems-and-POC** | Tier-3 novel threats + emerging tradecraft |
+| **THREAT-MODELLING-SOP-Behavioural-Patch-Resistant-TTPs** | Architectural doctrine + design rules |
 
 ---
 
