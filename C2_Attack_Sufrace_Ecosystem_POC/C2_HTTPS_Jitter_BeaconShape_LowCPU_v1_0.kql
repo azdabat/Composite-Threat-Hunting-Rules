@@ -5,7 +5,7 @@
 // TRUTH DOMAIN (Minimum Truth Sensors)
 //   - DeviceNetworkEvents: outbound TCP/443 flows with small total bytes
 // CONVERGENCE LIVES IN NETWORK RHYTHM + SUSPICIOUS PARENT LINEAGE - EXECUTION CONTEXT
-//
+// MISSING: ORG PREV
 // WHY THIS EXISTS (Attacker Tradecraft)
 //   Many C2s use HTTPS beacons with semi-regular timing + jitter. This is a "shape" hunt:
 //   protocol-agnostic, infrastructure-agnostic, and resilient to domain rotation.
