@@ -30,6 +30,7 @@
 //   - Suppress common Windows maintenance/updaters
 //   - Drop “weak execution only + no reinforcement” cases
 //   - Keep all reinforcement optional (does not redefine baseline truth)
+// The Attack: Inbound SMB (445) + Immediate Timeframe + Uncommon Service Child = 99% Malicious Lateral Movement.
 // ============================================================================
 
 let Lookback       = 3d;
