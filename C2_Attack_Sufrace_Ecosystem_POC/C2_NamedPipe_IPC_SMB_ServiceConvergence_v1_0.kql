@@ -39,8 +39,8 @@
 //   SOC-ready fields + HuntingDirectives array (your style).
 // ============================================================================
 
-let lookback = 7d;
-let slowServiceLookback = 21d;
+let lookback = 1d;
+let slowServiceLookback = 7d;
 
 let nearSmbWindow = 10m;
 let nearServiceWindow = 20m;
