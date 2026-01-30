@@ -1,0 +1,78 @@
+// ============================================================================
+// TIER-1 COMPOSITE — RANSOMWARE IMPACT: Shadow Copy & Recovery Destruction
+// Author: Ala Dabat
+// Status: Tier-1 Mandatory
+//
+// GOAL
+//   Detect ransomware endgame behaviour:
+//     - Deletion of Volume Shadow Copies
+//     - Backup catalog removal
+//     - Recovery inhibition
+//
+// MINIMUM TRUTH
+//   - Execution of shadow deletion primitives (vssadmin/wmic/diskshadow)
+//
+// REINFORCEMENT
+//   - Suspicious parent (PowerShell, cmd, remote exec)
+//   - Near file encryption velocity (optional cousin rule link)
+//
+// MITRE
+//   TA0040 Impact
+//   T1490 Inhibit System Recovery
+// ============================================================================
+
+let lookback = 7d;
+
+let DestructionCommands = dynamic([
+  "vssadmin delete shadows",
+  "wmic shadowcopy delete",
+  "diskshadow",
+  "bcdedit /set {default} recoveryenabled no",
+  "wbadmin delete catalog",
+  "wbadmin delete systemstatebackup",
+  "wevtutil cl"
+]);
+
+let SuspiciousParents = dynamic([
+  "powershell.exe","pwsh.exe","cmd.exe",
+  "wscript.exe","cscript.exe",
+  "psexecsvc.exe","wmic.exe"
+]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| extend Cmd = tolower(ProcessCommandLine)
+| where Cmd has_any (DestructionCommands)
+
+| extend Parent = tolower(InitiatingProcessParentFileName)
+| extend SuspParent = Parent has_any (SuspiciousParents)
+
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    CommandSet = make_set(ProcessCommandLine, 5),
+    ParentSet  = make_set(InitiatingProcessParentFileName, 5)
+  by DeviceName, AccountName, FileName
+
+| extend BaseScore = 70
+| extend ContextScore = iif(SuspParent, 20, 0)
+| extend FinalScore = BaseScore + ContextScore
+
+| extend Severity = case(
+    FinalScore >= 90, "CRITICAL",
+    FinalScore >= 70, "HIGH",
+    "MEDIUM"
+)
+
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] Recovery destruction primitive executed on ", DeviceName),
+    strcat("[COMMAND] ", tostring(CommandSet)),
+    strcat("[PARENT] ", tostring(ParentSet)),
+    "[NEXT] Treat as ransomware endgame until disproven.",
+    "[CONTAIN] Isolate host immediately; block lateral movement.",
+    "[IR] Check for concurrent encryption velocity + service stops."
+)
+
+| project FirstSeen, DeviceName, AccountName, Severity,
+          CommandSet, ParentSet, HuntingDirectives
+| order by FirstSeen desc
