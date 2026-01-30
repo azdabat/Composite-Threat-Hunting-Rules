@@ -1,0 +1,73 @@
+// ============================================================================
+// TIER-1 COMPOSITE — RANSOMWARE IMPACT: Service Stop Wave (Security + Backup Kill)
+// Author: Ala Dabat
+// Status: Tier-1 Baseline Backbone
+//
+// GOAL
+//   Detect ransomware operators stopping services to disable:
+//     - EDR agents
+//     - Backup services
+//     - Database locks
+//
+// MINIMUM TRUTH
+//   - Burst of service stop commands in short window
+//
+// REINFORCEMENT
+//   - Rare initiating process
+//   - Targeting known defensive services
+//
+// MITRE
+//   TA0040 Impact
+//   T1489 Service Stop
+// ============================================================================
+
+let lookback = 7d;
+let burstWindow = 10m;
+let StopThreshold = 5;
+
+let HighValueServices = dynamic([
+  "sense","windefend","mssql","sqlwriter",
+  "veeam","backup","sophos","crowdstrike",
+  "carbonblack","elastic","splunk"
+]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| extend Cmd = tolower(ProcessCommandLine)
+| where Cmd has_any ("net stop","sc stop","taskkill")
+
+| extend TargetHit = Cmd has_any (HighValueServices)
+
+| summarize
+    StopCommands = count(),
+    SampleCmds = make_set(ProcessCommandLine, 5),
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    TargetedDefenses = max(iff(TargetHit,1,0))
+  by DeviceName, AccountName, FileName, bin(Timestamp, burstWindow)
+
+| where StopCommands >= StopThreshold
+
+| extend BaseScore = 50
+| extend TargetScore = iif(TargetedDefenses == 1, 30, 0)
+| extend VelocityScore = iif(StopCommands >= 10, 20, 10)
+
+| extend FinalScore = BaseScore + TargetScore + VelocityScore
+| extend Severity = case(
+    FinalScore >= 90, "CRITICAL",
+    FinalScore >= 70, "HIGH",
+    "MEDIUM"
+)
+
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] Service stop wave detected on ", DeviceName),
+    strcat("[COUNT] StopCommands=", StopCommands),
+    strcat("[TARGET] DefensiveServicesTargeted=", tostring(TargetedDefenses)),
+    "[NEXT] Correlate with encryption velocity + shadow deletion.",
+    "[CONTAIN] Assume ransomware staging. Isolate host immediately.",
+    "[IR] Validate service tamper legitimacy (maintenance vs attack)."
+)
+
+| project FirstSeen, DeviceName, AccountName, Severity,
+          StopCommands, SampleCmds, HuntingDirectives
+| order by FinalScore desc
