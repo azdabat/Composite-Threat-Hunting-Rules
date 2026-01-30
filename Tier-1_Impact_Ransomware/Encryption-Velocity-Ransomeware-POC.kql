@@ -1,0 +1,115 @@
+// ============================================================================
+// TIER-1 COMPOSITE — RANSOMWARE IMPACT: Encryption Velocity (Mass File Rewrite)
+// Author: Ala Dabat
+// Status: POC → Tier-1 Baseline Backbone
+//
+// GOAL
+//   Detect ransomware-style encryption impact by identifying:
+//     - High-velocity file modification/rename/write bursts
+//     - Concentrated extension drift
+//     - Untrusted or rare initiating processes
+//
+// WHY THIS EXISTS (Enterprise Reality)
+//   Every ransomware family converges on the same unavoidable truth:
+//     → Mass file rewrite at machine speed.
+//
+// MINIMUM TRUTH (Anchor)
+//   - Single process causes abnormal volume of file modifications in short window.
+//
+// REINFORCEMENT (Convergence)
+//   - Rare process prevalence in tenant
+//   - Suspicious directory concentration (user data)
+//   - Extension entropy drift (.locked/.encrypted/etc)
+//
+// NOISE CONTROLS
+//   - Exclude known backup/indexing/system processes
+//   - Require velocity threshold + rarity scoring
+//
+// MITRE
+//   TA0040 Impact
+//   T1486 Data Encrypted for Impact
+// ============================================================================
+
+let lookback = 24h;
+let burstWindow = 5m;
+let FileBurstThreshold = 200;     // Tune per org size
+let RareProcHostThreshold = 3;
+
+let SafeProcesses = dynamic([
+  "onedrive.exe","teams.exe","outlook.exe","searchindexer.exe",
+  "svchost.exe","explorer.exe","msmpeng.exe","senseir.exe"
+]);
+
+let UserDataPaths = dynamic([
+  "\\users\\","\\documents\\","\\desktop\\","\\downloads\\",
+  "\\onedrive\\","\\shares\\","\\public\\"
+]);
+
+// --- File Modification Velocity Anchor ---
+let FileBursts =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileModified","FileRenamed","FileCreated")
+| extend Proc = tolower(InitiatingProcessFileName)
+| where Proc !in~ (SafeProcesses)
+| extend Folder = tolower(FolderPath)
+| extend InUserData = Folder has_any (UserDataPaths)
+| summarize
+    BurstFiles = count(),
+    DistinctFolders = dcount(FolderPath),
+    ExtensionSet = make_set(FileExtension, 15),
+    SamplePaths = make_set(FileName, 5),
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp)
+  by DeviceName, Proc, InitiatingProcessCommandLine, bin(Timestamp, burstWindow)
+| where BurstFiles >= FileBurstThreshold;
+
+// --- Org Prevalence (Rarity Reinforcement) ---
+let ProcPrevalence =
+DeviceProcessEvents
+| where Timestamp >= ago(7d)
+| summarize HostCount = dcount(DeviceName) by Proc = tolower(FileName);
+
+// --- Composite Scoring ---
+FileBursts
+| join kind=leftouter ProcPrevalence on Proc
+| extend HostCount = coalesce(HostCount, 0)
+| extend RarityScore = case(
+      HostCount <= 1, 30,
+      HostCount <= RareProcHostThreshold, 20,
+      0
+  )
+| extend VelocityScore = case(
+      BurstFiles >= 500, 60,
+      BurstFiles >= 300, 45,
+      30
+  )
+| extend ContextScore =
+      iif(DistinctFolders >= 10, 15, 0)
+    + iif(tostring(ExtensionSet) has_any ("locked","encrypted","crypt","enc"), 15, 0);
+
+| extend FinalScore = VelocityScore + RarityScore + ContextScore
+| extend Severity = case(
+    FinalScore >= 90, "CRITICAL",
+    FinalScore >= 70, "HIGH",
+    FinalScore >= 50, "MEDIUM",
+    "LOW"
+)
+
+| where Severity != "LOW"
+
+// --- SOC Output ---
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] Encryption velocity detected on ", DeviceName),
+    strcat("[PROCESS] ", Proc, " | FilesTouched=", BurstFiles),
+    strcat("[RARITY] HostPrevalence=", HostCount, " | RarityScore=", RarityScore),
+    strcat("[SCOPE] DistinctFolders=", DistinctFolders),
+    "[NEXT] Immediate containment: isolate host, acquire volatile memory.",
+    "[PIVOT] Search for same process/hash across estate.",
+    "[IMPACT] Validate file extensions + ransom note creation."
+)
+
+| project Timestamp, DeviceName, Proc, BurstFiles, DistinctFolders,
+          HostCount, FinalScore, Severity, ExtensionSet,
+          InitiatingProcessCommandLine, HuntingDirectives
+| order by FinalScore desc
