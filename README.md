@@ -421,14 +421,15 @@ If the non-negotiable baseline event (“truth”) requires a fundamental **sche
 - Host process execution → identity log transaction  
 - API call telemetry → artifact registry/file telemetry  
 - SMB/Service lateral movement → WMI/DCOM lateral movement  
-- DNS protocol telemetry → HTTP protocol telemetry  
-### Rule 1 — Split only when the **Minimum Truth Anchor** changes
+- DNS protocol telemetry → HTTP protocol telemetry
+   
+### Caveats For when we - Split only when the **Minimum Truth Anchor** changes
 
 Split a composite when the *non-negotiable baseline event* changes in mechanism.
 
 The **Minimum Truth Anchor** is the single unavoidable attacker action the rule is built on.
 
-✅ Reinforcement signals may cross telemetry surfaces (process, registry, file, network)  
+ Reinforcement signals may cross telemetry surfaces (process, registry, file, network)  
 **as long as they remain optional and do not replace the baseline truth.**
 
 ---
@@ -456,6 +457,12 @@ Example:
 The truth anchor remains execution — registry is supporting evidence, not the trigger.
 
 ---
+## Essential To Remember
+
+1) Truth Anchor = Sensor
+2) Reinforcement = Evidence
+3) Cousins = Adjacent sensors
+4) Incident = Story stitching
 
 **Truth defines the rule. Reinforcement strengthens it.**
 
