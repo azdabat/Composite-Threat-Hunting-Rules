@@ -311,8 +311,6 @@ Full design doctrine, naming strategy, and the complete ecosystem model (includi
 https://github.com/azdabat/Production-READY-Composite-Threat-Hunting-Rules/blob/main/Ecosystem_Deaign_Architecture.md
 
 --- 
-```
----
 
 ## Framework Logic Behind Cousin Pairing
 
