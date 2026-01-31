@@ -1281,5 +1281,39 @@ Composite engineering is clarity, not bloat.
 
 ---
 
+## Operationalising This Framework (Production Deployment)
+
+This repository is not a collection of isolated hunts — it is designed to run as a **Minimum Truth sensor ecosystem** in production.
+
+Each Composite Rule is deployed as an always-on detection **sensor**:
+
+- **Truth Anchor** defines the technique
+- **Reinforcement** increases confidence (not dependency)
+- **Cousin Rules** provide adjacent surface parity
+- **Attack Ecosystem chaining** creates incidents without monolithic kill-chain queries
+
+### Production Model (Two-Layer Correlation Only)
+
+Operational correlation happens **outside** individual rules:
+
+1. **Cousin Confirmation**  
+   Multiple cousins firing = capability confirmed at higher confidence  
+   (e.g., TaskCache persistence + schtasks classifier)
+
+2. **Attack Story Chaining**  
+   Multiple attack-stage truths converging = intrusion incident  
+   (Ingress → Execution → Persistence)
+
+### Full Deployment Specification
+
+The complete operational correlation + Sentinel engineering model lives here:
+
+➡️ **Operational Correlation & Deployment Guide**  
+https://github.com/azdabat/Production-READY-Composite-Threat-Hunting-Rules/blob/main/Operational_Correlation_Deployment.md
+
+This is how Tier-1 composite truths become Tier-2 incidents — **without monoliths, without ghost chains, and without noise collapse.**
+
+---
+
 This template is the backbone of my Tier-1 Enterprise Attack Ecosystem coverage.
 
