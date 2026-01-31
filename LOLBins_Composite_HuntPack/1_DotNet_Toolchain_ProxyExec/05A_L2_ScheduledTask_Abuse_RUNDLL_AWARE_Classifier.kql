@@ -1,0 +1,96 @@
+// ============================================================================
+// SINGLE-TABLE COMPOSITE (COREPLUS / L2.5): Persistence Activity — Task/Service/RunKey via Common Binaries
+// AUTHOR: Ala Dabat
+// STATUS: PRODUCTION HARDENED (tenant tuning expected)
+// DATA: DeviceProcessEvents
+//
+// WHY THIS EXISTS (and how it differs from your rundll-aware Scheduled Task composite):
+//   - This is a WIDE persistence surface detector:
+//       schtasks.exe, sc.exe, reg.exe, wmic.exe, powershell/cmd
+//     It catches "persistence creation intent" quickly and cheaply.
+//   - Your ScheduledTask_Abuse (rundll-aware) is a HIGH-FIDELITY classifier for schtasks.exe,
+//     with robust parsing + action categorisation + tuned suppression.
+//   - Use this rule to FLAG activity; use the rundll-aware composite to CLASSIFY + PRIORITISE schtasks cases.
+//
+// MITRE:
+//   T1053.005 (Scheduled Task)
+//   T1543.003 (Windows Service)
+//   T1547.001 (Registry Run Keys)
+// ============================================================================
+
+let Lookback = 7d;
+let Threshold = 70;
+
+let TargetProcs = dynamic(["schtasks.exe","at.exe","sc.exe","reg.exe","wmic.exe","powershell.exe","pwsh.exe","cmd.exe"]);
+let SuspiciousParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe","rundll32.exe","regsvr32.exe"]);
+let WritablePaths = dynamic(["\\users\\public\\","\\programdata\\","\\windows\\temp\\","\\temp\\","\\downloads\\","\\appdata\\local\\temp\\","\\appdata\\roaming\\","\\perflogs\\"]);
+let DangerousActions = dynamic(["powershell","pwsh","cmd.exe","wscript","cscript","mshta","rundll32","regsvr32","wmic","certutil","bitsadmin","curl","wget","ftp","tftp"]);
+let AllowStrings = dynamic(["\\microsoft\\windows\\","onedrive","teams","edgeupdate","googleupdate","sccm","ccm","intune","defender","microsoft update"]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in~ (TargetProcs)
+| where isnotempty(ProcessCommandLine)
+| extend Cmd = tolower(tostring(ProcessCommandLine))
+| extend Parent = tolower(tostring(InitiatingProcessFileName))
+| where not(Cmd has_any (AllowStrings))
+
+// ---- Detect persistence intent across surfaces
+| extend
+    IsTask = toint(FileName =~ "schtasks.exe" and Cmd has_any ("/create","/change") and Cmd has_any ("/tn","/tr")),
+    IsService = toint(FileName =~ "sc.exe" and Cmd has "create" and Cmd has "binpath="),
+    IsRunKey = toint(FileName =~ "reg.exe" and Cmd has " add " and Cmd has_any ("\\run","\\runonce","policies\\explorer\\run")),
+    IsWmiCreate = toint(FileName =~ "wmic.exe" and Cmd has_any ("process call create","startup","service")),
+    IsPSPersistence = toint(FileName in~ ("powershell.exe","pwsh.exe") and Cmd has_any ("new-scheduledtask","register-scheduledtask","new-service","set-itemproperty","runonce","\\run")),
+    BadParent = toint(Parent in~ (SuspiciousParents)),
+    UsesWritable = toint(Cmd has_any (WritablePaths)),
+    UsesDangerAction = toint(Cmd has_any (DangerousActions)),
+    HasEncoded = toint(Cmd has_any ("-enc","-encodedcommand","frombase64string","iex(")),
+    HasNet = toint(Cmd matches regex @"(?i)(http[s]?://|ftp://|\b\d{1,3}(\.\d{1,3}){3}\b|\\\\)")
+
+// Minimum truth gate
+| where IsTask==1 or IsService==1 or IsRunKey==1 or IsWmiCreate==1 or IsPSPersistence==1
+
+| extend
+    BaseScore = 45,
+    SurfaceScore =
+        (30 * IsTask) +
+        (30 * IsService) +
+        (28 * IsRunKey) +
+        (25 * IsWmiCreate) +
+        (25 * IsPSPersistence),
+    ContextScore =
+        (15 * UsesDangerAction) +
+        (15 * UsesWritable) +
+        (15 * HasEncoded) +
+        (10 * HasNet) +
+        (10 * BadParent),
+    RiskScore = tolong(BaseScore + SurfaceScore + ContextScore),
+    Severity = case(RiskScore >= 120, "CRITICAL", RiskScore >= 90, "HIGH", RiskScore >= 70, "MEDIUM", "LOW")
+| where RiskScore >= Threshold
+
+| extend PersistenceClass = case(
+    IsTask==1, "ScheduledTask",
+    IsService==1, "ServiceCreate",
+    IsRunKey==1, "RunKey",
+    IsWmiCreate==1, "WMI_Persistence_Adj",
+    IsPSPersistence==1, "PowerShell_Persistence_Adj",
+    "Other"
+)
+
+| extend HuntingDirectives = pack_array(
+    strcat("[MIN_TRUTH] Persistence intent detected via ", PersistenceClass, " surface."),
+    strcat("[SCORE] ", tostring(RiskScore), " | Severity=", Severity,
+           " | BadParent=", tostring(BadParent),
+           " | Writable=", tostring(UsesWritable),
+           " | Encoded=", tostring(HasEncoded),
+           " | Net=", tostring(HasNet)),
+    strcat("[PROC] ", FileName, " | Parent=", tostring(InitiatingProcessFileName)),
+    strcat("[CMD] ", substring(Cmd, 0, 260)),
+    "PIVOT: If ScheduledTask -> run your rundll-aware Scheduled Task composite (classification + /tr extraction).",
+    "PIVOT: If ServiceCreate -> check Service registry ImagePath, binary signer, and recent file writes to referenced path.",
+    "PIVOT: If RunKey -> pivot to your Registry_Persistence_Userland_Autoruns rule for registry truth + writer context.",
+    "[NEXT] Validate change ticket/owner. If unapproved: isolate if needed, collect referenced binaries/scripts, and scope fleet for same Cmd + same account."
+)
+| project Timestamp, DeviceName, AccountName, Severity, RiskScore, PersistenceClass, FileName, InitiatingProcessFileName, ProcessCommandLine, HuntingDirectives
+| order by RiskScore desc, Timestamp desc
