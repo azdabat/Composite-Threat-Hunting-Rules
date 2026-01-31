@@ -1,0 +1,86 @@
+// ============================================================================
+// SINGLE-TABLE COMPOSITE (COREPLUS / L2.5): Remote Execution / Lateral Movement Signals + WMIC XSL ProxyExec
+// AUTHOR: Ala Dabat
+// STATUS: PRODUCTION HARDENED (tenant tuning expected)
+// DATA: DeviceProcessEvents
+//
+// MITRE:
+//   T1021 (Remote Services) [WinRM/SC/SCHTASKS remote]
+//   T1047 (WMI)
+//   T1218 (Proxy Execution) [WMIC XSL]
+// ============================================================================
+
+let Lookback = 7d;
+let Threshold = 75;
+
+let TargetProcs = dynamic(["wmic.exe","winrs.exe","winrm.cmd","sc.exe","schtasks.exe","powershell.exe","pwsh.exe","cmd.exe"]);
+let SuspiciousParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let AllowStrings = dynamic(["ccmcache","sccm","intune","defender","\\microsoft\\windows\\"]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in~ (TargetProcs)
+| where isnotempty(ProcessCommandLine)
+| extend Cmd = tolower(tostring(ProcessCommandLine))
+| extend Parent = tolower(tostring(InitiatingProcessFileName))
+| where not(Cmd has_any (AllowStrings))
+| extend
+    HasRemoteHost = toint(Cmd has_any ("\\\\","/s ","/node:","-r:","-computername","new-pssession","invoke-command")),
+    HasCredFlags = toint(Cmd has_any ("-u:","/u ","-p:","/p ","-credential","/ru ","/rp ")),
+    HasEncoded = toint(Cmd has_any ("-enc","-encodedcommand","frombase64string","iex(")),
+    BadParent = toint(Parent in~ (SuspiciousParents)),
+
+    WmicXsl = toint(
+        FileName =~ "wmic.exe"
+        and Cmd has_any ("os get","/format:","format:")
+        and Cmd has ".xsl"
+        and Cmd matches regex @"(?i)https?://"
+    ),
+    RemoteScCreate = toint(FileName =~ "sc.exe" and Cmd has "\\\\" and Cmd has "create" and Cmd has "binpath="),
+    RemoteSchCreate = toint(FileName =~ "schtasks.exe" and Cmd has "/create" and Cmd has_any ("/s "," /u "," /p "," /tr "," /tn ")),
+    WinrsExec = toint(FileName =~ "winrs.exe" or Cmd has "winrs"),
+    WinrmInvoke = toint(FileName =~ "winrm.cmd" or Cmd has "winrm invoke" or Cmd has "winrm quickconfig"),
+    WmiRemoteExec = toint(FileName =~ "wmic.exe" and Cmd has "/node:" and Cmd has "process call create")
+| where WmicXsl==1 or RemoteScCreate==1 or RemoteSchCreate==1 or WinrsExec==1 or WinrmInvoke==1 or WmiRemoteExec==1 or HasRemoteHost==1
+
+| extend
+    BaseScore = 50,
+    ActionScore =
+        (75 * WmicXsl) +
+        (45 * RemoteScCreate) +
+        (45 * RemoteSchCreate) +
+        (30 * WmiRemoteExec) +
+        (25 * WinrsExec) +
+        (20 * WinrmInvoke) +
+        (20 * HasRemoteHost),
+    ContextScore =
+        (15 * HasCredFlags) +
+        (20 * HasEncoded) +
+        (10 * BadParent),
+    RiskScore = tolong(BaseScore + ActionScore + ContextScore),
+    Severity = case(RiskScore >= 150, "CRITICAL", RiskScore >= 110, "HIGH", RiskScore >= 75, "MEDIUM", "LOW")
+
+| where RiskScore >= Threshold
+| extend RemoteExecClass = case(
+    WmicXsl==1, "WMIC_XSL_ProxyExec",
+    RemoteSchCreate==1, "Remote_SCHTASKS_Create",
+    RemoteScCreate==1, "Remote_SC_CreateService",
+    WmiRemoteExec==1, "WMIC_Remote_ProcessCreate",
+    WinrsExec==1, "WINRS_RemoteExec",
+    "Remote_Management_Adj"
+)
+
+| extend HuntingDirectives = pack_array(
+    strcat("[MIN_TRUTH] Remote execution / lateral signal: ", RemoteExecClass),
+    strcat("[SCORE] ", tostring(RiskScore), " | Severity=", Severity,
+           " | CredFlags=", tostring(HasCredFlags),
+           " | Encoded=", tostring(HasEncoded),
+           " | BadParent=", tostring(BadParent)),
+    strcat("[PROC] ", FileName, " | Parent=", tostring(InitiatingProcessFileName)),
+    strcat("[CMD] ", substring(Cmd, 0, 260)),
+    "PIVOT: Check DeviceNetworkEvents for SMB(445)/WinRM(5985/5986)/RPC(135)/RDP(3389) from this host in same window.",
+    "PIVOT: Look for remote logons (type 3/9), new admin shares access, and credential access on source host.",
+    "[NEXT] If unapproved: isolate impacted hosts, validate target endpoints, and scope for same remote host strings across fleet."
+)
+| project Timestamp, DeviceName, AccountName, Severity, RiskScore, RemoteExecClass, FileName, InitiatingProcessFileName, ProcessCommandLine, HuntingDirectives
+| order by RiskScore desc, Timestamp desc
