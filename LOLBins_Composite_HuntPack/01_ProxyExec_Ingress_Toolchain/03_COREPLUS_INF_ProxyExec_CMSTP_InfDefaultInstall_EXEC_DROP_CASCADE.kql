@@ -1,0 +1,152 @@
+// ============================================================================
+// COMPOSITE HUNT (COREPLUS / L2.5): INF-Based Proxy Execution — CMSTP / InfDefaultInstall (+ pivots)
+// AUTHOR: Ala Dabat
+// STATUS: PRODUCTION HARDENED (tenant tuning expected)
+// DATA: DeviceProcessEvents + DeviceFileEvents
+//
+// MITRE:
+//   T1218.003 (CMSTP)
+//   T1218 (System Binary Proxy Execution)
+//   T1059 (Scripting)
+//   T1105 (Ingress Tool Transfer) [when remote INF/XSL/script refs exist]
+//
+// WHY COMPOSITE (Framework):
+//   Minimum Truth    : CMSTP/InfDefaultInstall executes with INF install intent (silent flags / INF refs)
+//   Reinforcement T1 : Near file-write evidence to writable path/suspicious extension (tool-write OR parent-write)
+//   Reinforcement T1 : Near child-process cascade from the parent (install → payload)
+//   Reinforcement T2 : Remote INF / script/proxy tokens / suspicious parent / writable targeting
+// ============================================================================
+
+let Lookback = 7d;
+let Threshold = 75;
+let NearWindowMins = 10;
+
+let TargetProcs = dynamic(["cmstp.exe","infdefaultinstall.exe"]);
+let PivotProcs  = dynamic(["regsvr32.exe","mshta.exe","rundll32.exe","control.exe","odbcconf.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","powerpnt.exe","mshta.exe"]);
+let WritablePathHints = dynamic(["\\users\\public\\","\\programdata\\","\\windows\\temp\\","\\temp\\","\\downloads\\","\\appdata\\local\\temp\\","\\appdata\\roaming\\","\\perflogs\\"]);
+let SuspTargetExts = dynamic([".inf",".ps1",".vbs",".vbe",".js",".jse",".sct",".hta",".dll",".exe",".msi",".dat",".bin",".tmp"]);
+
+let AllowStrings = dynamic(["ccmcache","intune","defender","microsoft\\windows\\servicing","windows update"]);
+
+// 1) Base: Minimum Truth
+let Base =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in~ (TargetProcs) or FileName in~ (PivotProcs)
+| where isnotempty(ProcessCommandLine)
+| extend Cmd = tolower(tostring(ProcessCommandLine))
+| extend Parent = tolower(tostring(InitiatingProcessFileName))
+| where not(Cmd has_any (AllowStrings))
+| extend
+    HasInf = toint(Cmd has ".inf" or Cmd has "infdefaultinstall"),
+    CmstpSilent = toint(tolower(FileName) == "cmstp.exe" and (Cmd has_all (" /s "," /ni ") or Cmd has_all ("/s","/ni"))),
+    HasNet = toint(Cmd matches regex @"(?i)(http[s]?://|ftp://|\b\d{1,3}(\.\d{1,3}){3}\b|\\\\)"),
+    HasScriptProxy = toint(Cmd has_any ("scrobj.dll","javascript:","vbscript:","mshtml","scriptlet",".sct",".wsf",".hta")),
+    TargetsWritable = toint(Cmd has_any (WritablePathHints)),
+    TargetsSuspExt = toint(Cmd has_any (SuspTargetExts)),
+    BadParent = toint(Parent in~ (SuspiciousParents)),
+    IsC2OrRemoteInf = toint(tolower(FileName) == "cmstp.exe" and (HasNet == 1 or Cmd has " /au "))
+| where (HasInf == 1 or CmstpSilent == 1 or IsC2OrRemoteInf == 1) // ensure we're actually in the INF/CMSTP domain
+| project Timestamp, DeviceId, DeviceName, AccountName,
+          FileName, ProcessId, InitiatingProcessId,
+          Parent, Cmd,
+          HasInf, CmstpSilent, HasNet, HasScriptProxy, TargetsWritable, TargetsSuspExt, BadParent, IsC2OrRemoteInf;
+
+// 2) File artifacts reinforcement
+let FileArtifacts =
+DeviceFileEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType in ("FileCreated","FileRenamed","FileModified")
+| extend Path = tolower(tostring(FolderPath))
+| extend FullPath = strcat(Path, "\\", tolower(tostring(FileName)))
+| where Path has_any (WritablePathHints) or FullPath has_any (SuspTargetExts)
+| project DeviceId, WriterProcessId=InitiatingProcessId, FileTime=Timestamp, DroppedFile=FullPath;
+
+// 3) Child cascade reinforcement
+let ChildCascade =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| extend ChildProc = tolower(tostring(FileName))
+| where ChildProc !in~ ("conhost.exe","werfault.exe")
+| project DeviceId, ParentProcessId=InitiatingProcessId, ChildTime=Timestamp, ChildProc, ChildCmd=tostring(ProcessCommandLine);
+
+// 4) Join + post-join time checks
+Base
+| join kind=leftouter (FileArtifacts) on DeviceId
+| where (WriterProcessId == ProcessId or WriterProcessId == InitiatingProcessId)
+  and abs(datetime_diff("minute", Timestamp, FileTime)) <= NearWindowMins
+| summarize
+    FileNear = max(1),
+    DroppedFiles = make_set(DroppedFile, 10),
+    Timestamp = max(Timestamp),
+    DeviceName = any(DeviceName),
+    AccountName = any(AccountName),
+    FileName = any(FileName),
+    Cmd = any(Cmd),
+    Parent = any(Parent),
+    ProcessId = any(ProcessId),
+    InitiatingProcessId = any(InitiatingProcessId),
+    HasInf = any(HasInf),
+    CmstpSilent = any(CmstpSilent),
+    HasNet = any(HasNet),
+    HasScriptProxy = any(HasScriptProxy),
+    TargetsWritable = any(TargetsWritable),
+    TargetsSuspExt = any(TargetsSuspExt),
+    BadParent = any(BadParent),
+    IsC2OrRemoteInf = any(IsC2OrRemoteInf)
+  by DeviceId, ProcessId, InitiatingProcessId
+| join kind=leftouter (ChildCascade) on DeviceId
+| where (ParentProcessId == InitiatingProcessId)
+  and abs(datetime_diff("minute", Timestamp, ChildTime)) <= NearWindowMins
+| summarize
+    ChildNear = max(1),
+    ChildProcs = make_set(ChildProc, 10),
+    Timestamp = max(Timestamp),
+    DeviceName = any(DeviceName),
+    AccountName = any(AccountName),
+    FileName = any(FileName),
+    Cmd = any(Cmd),
+    Parent = any(Parent),
+    HasInf = any(HasInf),
+    CmstpSilent = any(CmstpSilent),
+    HasNet = any(HasNet),
+    HasScriptProxy = any(HasScriptProxy),
+    TargetsWritable = any(TargetsWritable),
+    TargetsSuspExt = any(TargetsSuspExt),
+    BadParent = any(BadParent),
+    IsC2OrRemoteInf = any(IsC2OrRemoteInf),
+    FileNear = max(FileNear),
+    DroppedFiles = any(DroppedFiles)
+  by DeviceId, ProcessId, InitiatingProcessId
+
+// 5) Score
+| extend
+    BaseScore = 55,
+    ContextScore =
+        (35 * iff(CmstpSilent == 1, 1, 0)) +
+        (25 * iff(IsC2OrRemoteInf == 1, 1, 0)) +
+        (20 * iff(HasNet == 1, 1, 0)) +
+        (20 * iff(HasScriptProxy == 1, 1, 0)) +
+        (15 * iff(BadParent == 1, 1, 0)) +
+        (10 * iff(TargetsWritable == 1, 1, 0)) +
+        (10 * iff(TargetsSuspExt == 1, 1, 0)),
+    ReinforceScore =
+        (25 * iff(FileNear == 1, 1, 0)) +
+        (25 * iff(ChildNear == 1, 1, 0)),
+    RiskScore = tolong(BaseScore + ContextScore + ReinforceScore),
+    Severity = case(RiskScore >= 110, "CRITICAL", RiskScore >= 85, "HIGH", "MEDIUM")
+| where RiskScore >= Threshold
+
+// 6) Output
+| extend HuntingDirectives = pack_array(
+    strcat("[MIN_TRUTH] ", FileName, " executed in INF/CMSTP proxy-exec domain."),
+    strcat("[SCORE] ", tostring(RiskScore), " | Severity=", Severity,
+           " | FileNear=", tostring(FileNear), " | ChildNear=", tostring(ChildNear)),
+    strcat("[CMD] ", substring(Cmd, 0, 240)),
+    iif(FileNear==1, strcat("[FILE] Artifact(s) dropped by TOOL or PARENT: ", tostring(DroppedFiles)), "[FILE] No near writable/suspicious artifacts."),
+    iif(ChildNear==1, strcat("[CASCADE] Sibling processes near parent: ", tostring(ChildProcs)), "[CASCADE] No sibling execution observed."),
+    "[NEXT] If unauthorized: collect INF, identify referenced binaries/scripts, review task/service/RunKey persistence, and scope fleet for same Cmd patterns."
+)
+| project Timestamp, DeviceName, AccountName, FileName, RiskScore, Severity, Parent, Cmd, FileNear, DroppedFiles, ChildNear, ChildProcs, HuntingDirectives
+| order by RiskScore desc, Timestamp desc
