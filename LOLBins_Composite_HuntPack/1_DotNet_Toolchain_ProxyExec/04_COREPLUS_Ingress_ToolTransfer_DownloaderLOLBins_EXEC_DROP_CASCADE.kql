@@ -1,0 +1,162 @@
+// ============================================================================
+// COMPOSITE HUNT (COREPLUS / L2.5): Script Proxy Execution — MSHTA / REGSVR32 / RUNDLL32 / WSCRIPT / CSCRIPT / ODBCCONF / CONTROL
+// AUTHOR: Ala Dabat
+// STATUS: PRODUCTION HARDENED (tenant tuning expected)
+// DATA: DeviceProcessEvents + DeviceFileEvents
+//
+// MITRE:
+//   T1218 (System Binary Proxy Execution)
+//   T1059 (Command and Scripting Interpreter)
+//   T1105 (Ingress Tool Transfer) [when remote fetch present]
+//
+// WHY COMPOSITE (Framework):
+//   Minimum Truth    : LOLBin executes with script/proxy indicators (scriptlet/protocol/COM) OR remote reference
+//   Reinforcement T1 : Near file-write evidence (tool-write OR parent-write) to writable path/suspicious extension
+//   Reinforcement T1 : Near child-process cascade from the parent (proxy exec → payload)
+//   Reinforcement T2 : Suspicious parent + writable-path targeting + suspicious extension targeting
+//
+// NOTES:
+//   - This is your “02 monolith” rebuilt as your Ingress-style composite.
+// ============================================================================
+
+let Lookback = 7d;
+let Threshold = 75;
+let NearWindowMins = 10;
+
+let TargetProcs = dynamic(["mshta.exe","regsvr32.exe","rundll32.exe","wscript.exe","cscript.exe","odbcconf.exe","control.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","winword.exe","excel.exe","outlook.exe","powerpnt.exe","mshta.exe","wscript.exe","cscript.exe"]);
+let WritablePathHints = dynamic(["\\users\\public\\","\\programdata\\","\\windows\\temp\\","\\temp\\","\\downloads\\","\\appdata\\local\\temp\\","\\appdata\\roaming\\","\\perflogs\\"]);
+let SuspTargetExts = dynamic([".ps1",".vbs",".vbe",".js",".jse",".sct",".wsf",".hta",".dll",".cpl",".exe",".msi",".dat",".bin",".tmp"]);
+
+let ScriptProtoTokens = dynamic(["javascript:","vbscript:","mshtml","scrobj","scriptlet","scrobj.dll",".sct",".wsf",".hta","wscript.shell"]);
+let RegsvrTokens = dynamic(["/s","-s","/n","/i:","scrobj.dll"]);
+let RundllWeirdExportRx = @",\s*(#\d+|run|start|dllregisterserver|entry|main|shellexec_rundll)";
+
+let AllowStrings = dynamic([
+  "\\microsoft\\edge\\",
+  "googleupdate",
+  "onedrive",
+  "teams",
+  "citrix",
+  "ccmcache",
+  "intune"
+]);
+
+// 1) Base: Minimum Truth
+let Base =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in~ (TargetProcs)
+| where isnotempty(ProcessCommandLine)
+| extend Cmd = tolower(tostring(ProcessCommandLine))
+| extend Parent = tolower(tostring(InitiatingProcessFileName))
+| where not(Cmd has_any (AllowStrings))
+| extend
+    HasNet = Cmd matches regex @"(?i)(http[s]?://|ftp://|\b\d{1,3}(\.\d{1,3}){3}\b|\\\\)",
+    HasScriptProto = Cmd has_any (ScriptProtoTokens),
+    TargetsWritable = Cmd has_any (WritablePathHints),
+    TargetsSuspExt = Cmd has_any (SuspTargetExts),
+    BadParent = Parent in~ (SuspiciousParents),
+    WeirdExport = toint(tolower(FileName) == "rundll32.exe" and Cmd matches regex RundllWeirdExportRx),
+    RegsvrProxy = toint(tolower(FileName) == "regsvr32.exe" and (Cmd has_any (RegsvrTokens) or Cmd has "scrobj.dll"))
+| where HasNet or HasScriptProto or WeirdExport == 1 or RegsvrProxy == 1
+| project Timestamp, DeviceId, DeviceName, AccountName,
+          FileName, ProcessId, InitiatingProcessId,
+          Parent, Cmd,
+          HasNet, HasScriptProto, TargetsWritable, TargetsSuspExt, BadParent, WeirdExport, RegsvrProxy;
+
+// 2) File artifacts reinforcement
+let FileArtifacts =
+DeviceFileEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType in ("FileCreated","FileRenamed","FileModified")
+| extend Path = tolower(tostring(FolderPath))
+| extend FullPath = strcat(Path, "\\", tolower(tostring(FileName)))
+| where Path has_any (WritablePathHints) or FullPath has_any (SuspTargetExts)
+| project DeviceId, WriterProcessId=InitiatingProcessId, FileTime=Timestamp, DroppedFile=FullPath;
+
+// 3) Child cascade reinforcement
+let ChildCascade =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| extend ChildProc = tolower(tostring(FileName))
+| where ChildProc !in~ ("conhost.exe","werfault.exe")
+| project DeviceId, ParentProcessId=InitiatingProcessId, ChildTime=Timestamp, ChildProc, ChildCmd=tostring(ProcessCommandLine);
+
+// 4) Join + post-join time window checks
+Base
+| join kind=leftouter (FileArtifacts) on DeviceId
+| where (WriterProcessId == ProcessId or WriterProcessId == InitiatingProcessId)
+  and abs(datetime_diff("minute", Timestamp, FileTime)) <= NearWindowMins
+| summarize
+    FileNear = max(1),
+    DroppedFiles = make_set(DroppedFile, 10),
+    Timestamp = max(Timestamp),
+    DeviceName = any(DeviceName),
+    AccountName = any(AccountName),
+    FileName = any(FileName),
+    Cmd = any(Cmd),
+    Parent = any(Parent),
+    ProcessId = any(ProcessId),
+    InitiatingProcessId = any(InitiatingProcessId),
+    HasNet = any(HasNet),
+    HasScriptProto = any(HasScriptProto),
+    TargetsWritable = any(TargetsWritable),
+    TargetsSuspExt = any(TargetsSuspExt),
+    BadParent = any(BadParent),
+    WeirdExport = any(WeirdExport),
+    RegsvrProxy = any(RegsvrProxy)
+  by DeviceId, ProcessId, InitiatingProcessId
+| join kind=leftouter (ChildCascade) on DeviceId
+| where (ParentProcessId == InitiatingProcessId)
+  and abs(datetime_diff("minute", Timestamp, ChildTime)) <= NearWindowMins
+| summarize
+    ChildNear = max(1),
+    ChildProcs = make_set(ChildProc, 10),
+    Timestamp = max(Timestamp),
+    DeviceName = any(DeviceName),
+    AccountName = any(AccountName),
+    FileName = any(FileName),
+    Cmd = any(Cmd),
+    Parent = any(Parent),
+    HasNet = any(HasNet),
+    HasScriptProto = any(HasScriptProto),
+    TargetsWritable = any(TargetsWritable),
+    TargetsSuspExt = any(TargetsSuspExt),
+    BadParent = any(BadParent),
+    WeirdExport = any(WeirdExport),
+    RegsvrProxy = any(RegsvrProxy),
+    FileNear = max(FileNear),
+    DroppedFiles = any(DroppedFiles)
+  by DeviceId, ProcessId, InitiatingProcessId
+
+// 5) Score
+| extend
+    BaseScore = 55,
+    ContextScore =
+        (25 * iff(HasNet, 1, 0)) +
+        (25 * iff(HasScriptProto, 1, 0)) +
+        (18 * iff(RegsvrProxy == 1, 1, 0)) +
+        (18 * iff(WeirdExport == 1, 1, 0)) +
+        (15 * iff(BadParent, 1, 0)) +
+        (10 * iff(TargetsWritable, 1, 0)) +
+        (10 * iff(TargetsSuspExt, 1, 0)),
+    ReinforceScore =
+        (25 * iff(FileNear == 1, 1, 0)) +
+        (25 * iff(ChildNear == 1, 1, 0)),
+    RiskScore = tolong(BaseScore + ContextScore + ReinforceScore),
+    Severity = case(RiskScore >= 105, "CRITICAL", RiskScore >= 85, "HIGH", "MEDIUM")
+| where RiskScore >= Threshold
+
+// 6) Output
+| extend HuntingDirectives = pack_array(
+    strcat("[MIN_TRUTH] ", FileName, " executed with script/proxy indicators."),
+    strcat("[SCORE] ", tostring(RiskScore), " | Severity=", Severity,
+           " | FileNear=", tostring(FileNear), " | ChildNear=", tostring(ChildNear)),
+    strcat("[CMD] ", substring(Cmd, 0, 240)),
+    iif(FileNear==1, strcat("[FILE] Artifact(s) dropped by TOOL or PARENT: ", tostring(DroppedFiles)), "[FILE] No near writable/suspicious artifacts."),
+    iif(ChildNear==1, strcat("[CASCADE] Sibling processes near parent: ", tostring(ChildProcs)), "[CASCADE] No sibling execution observed."),
+    "[NEXT] Validate URL/UNC targets, inspect dropped files, review parent lineage (Office/script), and hunt for follow-on persistence."
+)
+| project Timestamp, DeviceName, AccountName, FileName, RiskScore, Severity, Parent, Cmd, FileNear, DroppedFiles, ChildNear, ChildProcs, HuntingDirectives
+| order by RiskScore desc, Timestamp desc
