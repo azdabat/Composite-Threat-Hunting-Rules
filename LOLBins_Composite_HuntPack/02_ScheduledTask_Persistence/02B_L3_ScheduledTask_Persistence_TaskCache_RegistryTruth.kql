@@ -1,0 +1,236 @@
+// ============================================================================
+// COMPOSITE HUNT (L3): Registry_Persistence_Background_Service_TaskCache
+// Author: Ala Dabat
+// Version: 2026-01 (V2) | Status: PRODUCTION-HARDENED (tenant tuning expected)
+//
+// TRUTH DOMAIN:
+//   DeviceRegistryEvents (+ writer enrichment)
+//
+// MINIMUM TRUTH (Truth Anchor):
+//   A RegistryValueSet occurs in ONE of these persistence surfaces:
+//     1) Scheduled TaskCache registry surfaces (Tree/Tasks)  [silent task creation via COM/API]
+//     2) Service persistence via ImagePath write under Services (meaningful service persistence)
+//
+// WHY THIS EXISTS (Blind Spot Fix):
+//   - Attackers can register scheduled tasks via COM/PowerShell APIs without schtasks.exe.
+//     The task still materializes in TaskCache (Tree/Tasks).
+//   - Service churn is noisy unless you anchor on ImagePath (or equivalent service start binary).
+//
+// REINFORCEMENT (Confidence only; does not redefine truth):
+//   - Dangerous primitives in value data or writer command line (LOLBins/script engines/encoded)
+//   - Network indicators (URL/domain/IP) in value data
+//   - User-writable targets (Temp/Public/ProgramData/AppData/Downloads)
+//   - Large registry blobs (payload stash / encoded payload storage)
+//   - Untrusted + rare writer (org prevalence)
+//
+// NOISE CONTROLS:
+//   - Safe vendor + safe path suppressed unless strong indicators (danger/base64/net/writable/blob)
+//   - Trusted installer/updater initiators suppressed unless strong indicators
+//   - Services surface gated to ImagePath writes (or strong indicators) to avoid “any service churn”
+//
+// DATA SOURCES:
+//   - DeviceRegistryEvents (anchor)
+//   - DeviceProcessEvents (writer context)
+//   - DeviceFileEvents (org prevalence reinforcement via writer SHA256)
+//
+// MITRE:
+//   - T1543.003 Windows Service
+//   - T1053.005 Scheduled Task
+// ============================================================================
+
+let lookback = 14d;
+
+// ---- Tenant tunables
+let TrustedPublishers = dynamic([
+  "Microsoft Corporation","Microsoft Windows","Google LLC","Mozilla Corporation"
+]);
+
+let TrustedInitiators = dynamic([
+  "msiexec.exe","trustedinstaller.exe","sppsvc.exe","intunemanagementextension.exe","updateinstaller.exe"
+]);
+
+// ---- Persistence surfaces
+let BackgroundKeys = dynamic([
+  @"system\currentcontrolset\services",
+  @"software\microsoft\windows nt\currentversion\schedule\taskcache\tree",
+  @"software\microsoft\windows nt\currentversion\schedule\taskcache\tasks"
+]);
+
+// ---- Indicators
+let UserWritableRx   = @"(?i)^[a-z]:\\(users|public|programdata|windows\\temp|temp|downloads|appdata)\\";
+let Base64ChunkedRx  = @"(?:[A-Za-z0-9+/]{20,}={0,2})(?:\s+[A-Za-z0-9+/]{20,}={0,2})+";
+let IPv4Rx           = @"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b";
+let DomainRx         = @"\b([a-z0-9][a-z0-9-]{1,62}\.)+[a-z]{2,}\b";
+let UrlRx            = @"https?://[^\s'""<>]+";
+
+// ---- Dangerous primitives (kept broad but scored, not binary)
+let DangerTokens = dynamic([
+  "powershell","pwsh","cmd.exe","mshta","rundll32","regsvr32","wscript","cscript",
+  "certutil","bitsadmin","curl","wget",
+  "-enc","-encodedcommand","frombase64string","iex(","invoke-expression",
+  "http:","https:","ftp:"
+]);
+
+// ---- Noise anchors
+let SafePathAnchors = dynamic([
+  @"c:\program files", @"c:\program files (x86)", @"c:\windows\system32", @"c:\windows\syswow64"
+]);
+
+let SafeVendorKeywords = dynamic([
+  "windows update","microsoft","google","edge","mozilla","firefox","onedrive","teams",
+  "intel","nvidia","amd","realtek","adobe","citrix"
+]);
+
+let PayloadSizeThreshold = 500;
+
+// ---- Org prevalence reinforcement (rarity = reinforcement)
+let OrgPrevalence =
+  DeviceFileEvents
+  | where Timestamp >= ago(30d)
+  | summarize WriterDeviceCount = dcount(DeviceId) by SHA256;
+
+// 1) Anchor: registry writes in Services or TaskCache surfaces
+let Raw =
+  DeviceRegistryEvents
+  | where Timestamp >= ago(lookback)
+  | where ActionType == "RegistryValueSet"
+  | extend
+      RK  = tolower(tostring(RegistryKey)),
+      RVN = tolower(tostring(RegistryValueName)),
+      RVD = tolower(tostring(RegistryValueData))
+  | where RK has_any (BackgroundKeys);
+
+// 2) Enrich with writer process context
+let WithProc =
+  Raw
+  | join kind=leftouter (
+      DeviceProcessEvents
+      | where Timestamp >= ago(lookback)
+      | project
+          DeviceId,
+          InitiatingProcessId,
+          WriterFile    = tostring(InitiatingProcessFileName),
+          WriterCL      = tostring(InitiatingProcessCommandLine),
+          WriterSHA     = tostring(InitiatingProcessSHA256),
+          WriterSigner  = tostring(InitiatingProcessSigner),
+          WriterCompany = tostring(InitiatingProcessVersionInfoCompanyName),
+          WriterUser    = tostring(InitiatingProcessAccountName)
+    ) on DeviceId, InitiatingProcessId
+  | extend
+      WriterFileL = tolower(coalesce(WriterFile,"")),
+      WriterCLL   = tolower(coalesce(WriterCL,"")),
+      WriterSignerL  = tolower(coalesce(WriterSigner,"")),
+      WriterCompanyL = tolower(coalesce(WriterCompany,"")),
+      WriterTrustedPublisher = toint(WriterCompany in~ (TrustedPublishers) or WriterSigner in~ (TrustedPublishers)),
+      WriterTrustedInitiator = toint(WriterFileL in~ (TrustedInitiators));
+
+// 3) Add org prevalence
+let Enriched =
+  WithProc
+  | join kind=leftouter OrgPrevalence on $left.WriterSHA == $right.SHA256
+  | extend
+      WriterDeviceCount = coalesce(WriterDeviceCount, 0),
+      WriterIsRare = toint(WriterDeviceCount <= 2);
+
+// 4) Convergence + gating
+Enriched
+| extend
+    IsService   = toint(RK has "system\\currentcontrolset\\services"),
+    IsTaskCache = toint(RK has "schedule\\taskcache"),
+
+    // Services are only “meaningful persistence” when ImagePath is written (primary) — everything else is noisy.
+    ServiceImagePathWrite = toint(IsService == 1 and (RVN == "imagepath" or RVN has "imagepath")),
+
+    HasDanger      = toint(RVD has_any (DangerTokens) or WriterCLL has_any (DangerTokens)),
+    HasBase64      = toint(RVD matches regex Base64ChunkedRx or WriterCLL matches regex Base64ChunkedRx),
+    HasNet         = toint(RVD matches regex UrlRx or RVD matches regex IPv4Rx or RVD matches regex DomainRx),
+    PointsWritable = toint(RVD matches regex UserWritableRx),
+    IsLargeBlob    = toint(strlen(RVD) > PayloadSizeThreshold),
+
+    IsSafePath   = toint(RVD has_any (SafePathAnchors)),
+    IsSafeVendor = toint(RVD has_any (SafeVendorKeywords) or RVN has_any (SafeVendorKeywords)),
+
+    UntrustedWriter = toint(WriterTrustedPublisher == 0)
+
+// ---- Minimum truth enforcement (must be in one of the anchor surfaces)
+| where (IsService == 1 or IsTaskCache == 1)
+
+// ---- Surface gating:
+// - TaskCache: inherently high-signal persistence surface
+// - Services: require ImagePath OR strong indicators (danger/writable/blob) to avoid noise
+| where (IsTaskCache == 1)
+    or (ServiceImagePathWrite == 1)
+    or (HasDanger == 1)
+    or (PointsWritable == 1)
+    or (IsLargeBlob == 1)
+
+// ---- Noise suppression: safe vendor+safe path suppressed unless strong indicators exist
+| where not(IsSafePath == 1 and IsSafeVendor == 1 and HasDanger == 0 and HasBase64 == 0 and HasNet == 0 and PointsWritable == 0 and IsLargeBlob == 0)
+
+// ---- Trusted initiator suppression unless strong indicators
+| where not(WriterTrustedInitiator == 1 and (HasDanger + HasBase64 + HasNet + PointsWritable + IsLargeBlob) == 0)
+
+// 5) Scoring
+| extend
+    BaseScore = 55,
+    Score_TaskCache = 25 * IsTaskCache,
+    Score_Service   = 20 * ServiceImagePathWrite,
+    Score_Danger    = 25 * HasDanger,
+    Score_Base64    = 20 * HasBase64,
+    Score_Net       = 10 * HasNet,
+    Score_Writable  = 15 * PointsWritable,
+    Score_Blob      = 25 * IsLargeBlob,
+    Score_UntrustedWriter = 10 * UntrustedWriter,
+    Score_RareWriter = 10 * WriterIsRare,
+
+    RiskScore = BaseScore
+        + Score_TaskCache + Score_Service + Score_Danger + Score_Base64 + Score_Net
+        + Score_Writable + Score_Blob + Score_UntrustedWriter + Score_RareWriter,
+
+    RiskLevel = case(RiskScore >= 120, "CRITICAL",
+                     RiskScore >= 90,  "HIGH",
+                     RiskScore >= 70,  "MEDIUM",
+                     "LOW")
+
+| where RiskLevel in ("MEDIUM","HIGH","CRITICAL")
+
+// 6) Best-effort decode (only when base64-ish patterns exist)
+| extend DecodedPayload =
+    iif(HasBase64 == 1,
+        base64_decode_string(tostring(extract(@"([A-Za-z0-9+/]{40,})", 1, tostring(RegistryValueData)))),
+        ""
+    )
+
+| extend PersistenceClass =
+    case(IsTaskCache == 1, "TaskCache(SilentTask)",
+         ServiceImagePathWrite == 1, "Service(ImagePath)",
+         "Background(Other)")
+
+| project
+    Timestamp,
+    DeviceName,
+    DecodedPayload,
+    AccountName = coalesce(WriterUser, tostring(AccountName)),
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    PersistenceClass,
+    WriterProcess = WriterFile,
+    WriterCommandLine = WriterCL,
+    WriterCompany,
+    WriterSigner,
+    WriterSHA,
+    WriterDeviceCount,
+    HasDanger, HasBase64, HasNet, PointsWritable, IsLargeBlob,
+    RiskScore, RiskLevel
+
+| extend HunterDirective = case(
+    RiskLevel == "CRITICAL" and PersistenceClass startswith "TaskCache",
+      "CRITICAL: Silent Scheduled Task persistence via TaskCache (API/COM). Pull task definition (TaskCache GUID/Tree), validate owner/change, and scope for same task name/GUID across fleet.",
+    RiskLevel == "CRITICAL" and PersistenceClass startswith "Service",
+      "CRITICAL: Service persistence set (ImagePath). Validate service name + binary path, verify signer, collect binary, and scope other hosts for same ImagePath/WriterSHA.",
+    RiskLevel == "HIGH",
+      "HIGH: Background persistence registry artifact with strong indicators. Pivot to writer ancestry, recent file drops at referenced path, and hunt fleet for same RegistryValueData / WriterSHA.",
+    "MEDIUM: Background persistence signal. Validate if approved updater/agent; if not, pivot into writer lineage + referenced path triage."
+)
+| order by RiskScore desc, Timestamp desc
