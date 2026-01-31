@@ -1,0 +1,186 @@
+// ============================================================================
+// COMPOSITE HUNT (COREPLUS / L2.5): .NET Build/Compile / InstallUtil / Regasm / PCWRun — EXEC+DROP+CASCADE
+// AUTHOR: Ala Dabat
+// STATUS: PRODUCTION HARDENED (tenant tuning expected)
+// DATA: DeviceProcessEvents + DeviceFileEvents
+//
+// MITRE (common mappings):
+//   T1127 (Trusted Developer Utilities Proxy Execution)
+//   T1059 (Command and Scripting Interpreter)
+//   T1105 (Ingress Tool Transfer) [when remote fetch present]
+//   T1027 (Obfuscated/Encoded Files or Information)
+//
+// WHY COMPOSITE (Framework):
+//   Minimum Truth    : .NET toolchain binary executes with build/install/proxy-exec intent
+//   Reinforcement T1 : Near file-write evidence to writable path/suspicious extension (tool-write OR parent-write)
+//   Reinforcement T1 : Near child-process cascade from the parent (toolchain → payload execution)
+//   Reinforcement T2 : Remote reference OR encoded/obfuscated staging OR suspicious parent OR suspicious dir targeting
+//
+// SAFE (By design):
+//   - No prevalence joins
+//   - No expensive multi-workspace joins
+//   - Time-window checks occur POST-JOIN (no scope errors)
+//
+// TUNABLES:
+//   - Threshold, NearWindowMins, Lookback
+//   - AllowStrings / allow parents (tenant)
+// ============================================================================
+
+let Lookback = 7d;
+let Threshold = 75;
+let NearWindowMins = 10;
+
+let TargetProcs = dynamic(["msbuild.exe","csc.exe","csi.exe","ieexec.exe","installutil.exe","regasm.exe","pcwrun.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe","rundll32.exe","regsvr32.exe"]);
+let WritablePathHints = dynamic(["\\users\\public\\","\\programdata\\","\\windows\\temp\\","\\temp\\","\\downloads\\","\\appdata\\local\\temp\\","\\appdata\\roaming\\","\\perflogs\\"]);
+let SuspTargetExts = dynamic([".ps1",".vbs",".vbe",".js",".jse",".sct",".hta",".dll",".exe",".msi",".zip",".7z",".rar",".iso",".img",".cab",".dat",".bin",".tmp"]);
+let BuildTokens = dynamic([
+  ".csproj",".vbproj",".proj",".targets","/t:","/p:","/m",
+  "-target:","-reference:","-r:","/unsafe","/platform","-out:",
+  ".csx","-script",
+  ".application",".manifest",
+  "/u","uninstall","/logfile=","/logtoconsole","codebase","/tlb",
+  " -s "
+]);
+
+// tenant noise suppression (example starters)
+let AllowStrings = dynamic([
+  "ccmcache",
+  "microsoft\\visual studio",
+  "msbuild\\current\\bin",
+  "windows\\microsoft.net\\framework",
+  "intunemanagementextension",
+  "defender",
+  "configmgr"
+]);
+
+// --------------------
+// 1) Base: Minimum Truth (.NET toolchain intent)
+// --------------------
+let Base =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in~ (TargetProcs)
+| where isnotempty(ProcessCommandLine)
+| extend Cmd = tolower(tostring(ProcessCommandLine))
+| extend Parent = tolower(tostring(InitiatingProcessFileName))
+| where Cmd has_any (BuildTokens)
+| where not(Cmd has_any (AllowStrings))
+| extend
+    HasNet = Cmd matches regex @"(?i)(http[s]?://|ftp://|\b\d{1,3}(\.\d{1,3}){3}\b)",
+    HasEncoded = Cmd has_any ("-enc","-encodedcommand","frombase64string","iex(","invoke-expression","downloadstring"),
+    TargetsWritable = Cmd has_any (WritablePathHints),
+    TargetsSuspExt = Cmd has_any (SuspTargetExts),
+    BadParent = Parent in~ (SuspiciousParents),
+    PcwRunBroker = (tolower(FileName) == "pcwrun.exe" and Cmd has " -s "),
+    IeExecRemote = (tolower(FileName) == "ieexec.exe" and HasNet)
+| project
+    Timestamp, DeviceId, DeviceName, AccountName,
+    FileName, ProcessId, InitiatingProcessId,
+    Parent, Cmd,
+    HasNet, HasEncoded, TargetsWritable, TargetsSuspExt, BadParent, PcwRunBroker, IeExecRemote;
+
+// --------------------
+// 2) Reinforcement: File artifacts (cheap prefilter)
+// --------------------
+let FileArtifacts =
+DeviceFileEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType in ("FileCreated","FileRenamed","FileModified")
+| extend Path = tolower(tostring(FolderPath))
+| extend FullPath = strcat(Path, "\\", tolower(tostring(FileName)))
+| where Path has_any (WritablePathHints) or FullPath has_any (SuspTargetExts)
+| project DeviceId, WriterProcessId = InitiatingProcessId, FileTime = Timestamp, DroppedFile = FullPath;
+
+// --------------------
+// 3) Reinforcement: Child cascade (siblings from the parent)
+// --------------------
+let ChildCascade =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| extend ChildProc = tolower(tostring(FileName))
+| where ChildProc !in~ ("conhost.exe","werfault.exe")
+| project DeviceId, ParentProcessId = InitiatingProcessId, ChildTime = Timestamp, ChildProc, ChildCmd = tostring(ProcessCommandLine);
+
+// --------------------
+// 4) Join + time-window checks POST-JOIN
+// --------------------
+Base
+| join kind=leftouter (FileArtifacts) on DeviceId
+| where (WriterProcessId == ProcessId or WriterProcessId == InitiatingProcessId)
+  and abs(datetime_diff("minute", Timestamp, FileTime)) <= NearWindowMins
+| summarize
+    FileNear = max(1),
+    DroppedFiles = make_set(DroppedFile, 10),
+    Timestamp = max(Timestamp),
+    DeviceName = any(DeviceName),
+    AccountName = any(AccountName),
+    FileName = any(FileName),
+    Cmd = any(Cmd),
+    Parent = any(Parent),
+    ProcessId = any(ProcessId),
+    InitiatingProcessId = any(InitiatingProcessId),
+    HasNet = any(HasNet),
+    HasEncoded = any(HasEncoded),
+    TargetsWritable = any(TargetsWritable),
+    TargetsSuspExt = any(TargetsSuspExt),
+    BadParent = any(BadParent),
+    PcwRunBroker = any(PcwRunBroker),
+    IeExecRemote = any(IeExecRemote)
+  by DeviceId, ProcessId, InitiatingProcessId
+| join kind=leftouter (ChildCascade) on DeviceId
+| where (ParentProcessId == InitiatingProcessId)
+  and abs(datetime_diff("minute", Timestamp, ChildTime)) <= NearWindowMins
+| summarize
+    ChildNear = max(1),
+    ChildProcs = make_set(ChildProc, 10),
+    Timestamp = max(Timestamp),
+    DeviceName = any(DeviceName),
+    AccountName = any(AccountName),
+    FileName = any(FileName),
+    Cmd = any(Cmd),
+    Parent = any(Parent),
+    HasNet = any(HasNet),
+    HasEncoded = any(HasEncoded),
+    TargetsWritable = any(TargetsWritable),
+    TargetsSuspExt = any(TargetsSuspExt),
+    BadParent = any(BadParent),
+    PcwRunBroker = any(PcwRunBroker),
+    IeExecRemote = any(IeExecRemote),
+    FileNear = max(FileNear),
+    DroppedFiles = any(DroppedFiles)
+  by DeviceId, ProcessId, InitiatingProcessId
+
+// --------------------
+// 5) Score (simple + explainable)
+// --------------------
+| extend
+    BaseScore = 55,
+    ContextScore =
+        (25 * iff(PcwRunBroker or IeExecRemote, 1, 0)) +
+        (20 * iff(HasNet, 1, 0)) +
+        (20 * iff(HasEncoded, 1, 0)) +
+        (15 * iff(BadParent, 1, 0)) +
+        (10 * iff(TargetsWritable, 1, 0)) +
+        (10 * iff(TargetsSuspExt, 1, 0)),
+    ReinforceScore =
+        (25 * iff(FileNear == 1, 1, 0)) +
+        (25 * iff(ChildNear == 1, 1, 0)),
+    RiskScore = tolong(BaseScore + ContextScore + ReinforceScore),
+    Severity = case(RiskScore >= 100, "CRITICAL", RiskScore >= 85, "HIGH", "MEDIUM")
+| where RiskScore >= Threshold
+
+// --------------------
+// 6) Output
+// --------------------
+| extend HuntingDirectives = pack_array(
+    strcat("[MIN_TRUTH] ", FileName, " executed with .NET toolchain/proxy-exec intent."),
+    strcat("[SCORE] ", tostring(RiskScore), " | Severity=", Severity,
+           " | FileNear=", tostring(FileNear), " | ChildNear=", tostring(ChildNear)),
+    strcat("[CMD] ", substring(Cmd, 0, 240)),
+    iif(FileNear==1, strcat("[FILE] Artifact(s) dropped by TOOL or PARENT: ", tostring(DroppedFiles)), "[FILE] No near writable/suspicious artifacts."),
+    iif(ChildNear==1, strcat("[CASCADE] Sibling processes near parent: ", tostring(ChildProcs)), "[CASCADE] No sibling execution observed."),
+    "[NEXT] Validate whether build/install activity is expected. If not: inspect dropped artifacts, check signer/hash, and pivot into LOLBin/script execution hunts within ±24h."
+)
+| project Timestamp, DeviceName, AccountName, FileName, RiskScore, Severity, Parent, Cmd, FileNear, DroppedFiles, ChildNear, ChildProcs, HuntingDirectives
+| order by RiskScore desc, Timestamp desc
