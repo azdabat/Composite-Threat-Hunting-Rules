@@ -1,0 +1,64 @@
+// ============================================================================
+// SINGLE-TABLE COMPOSITE (COREPLUS / L2.5): Ransomware-Adjacent Defense Evasion — HARD CMDLINE TRUTH
+// AUTHOR: Ala Dabat
+// STATUS: PRODUCTION HARDENED (tenant tuning expected)
+// DATA: DeviceProcessEvents
+//
+// WHY NO JOINS:
+//   These commands are “hard truth” (delete shadows, clear logs, disable recovery, wipe free space, firewall off).
+//   Joins add context, not truth — so we keep this fast and decisive.
+//
+// MITRE:
+//   T1490 (Inhibit System Recovery)
+//   T1070.001 (Clear Windows Event Logs)
+//   T1562.004 (Disable or Modify System Firewall)
+//   T1562.001 (Impair Defenses)
+// ============================================================================
+
+let Lookback = 7d;
+let Threshold = 70;
+
+let TargetProcs = dynamic(["vssadmin.exe","wevtutil.exe","bcdedit.exe","bcedit.exe","wbadmin.exe","fsutil.exe","cipher.exe","netsh.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe"]);
+let AllowStrings = dynamic(["ccmcache","windows\\system32\\svchost.exe -k netsvcs","defender","microsoft update","sihclient","usoclient"]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in~ (TargetProcs)
+| where isnotempty(ProcessCommandLine)
+| extend Cmd = tolower(tostring(ProcessCommandLine))
+| extend Parent = tolower(tostring(InitiatingProcessFileName))
+| where not(Cmd has_any (AllowStrings))
+| extend
+    IsShadowDelete = toint(FileName =~ "vssadmin.exe" and Cmd has_any ("delete shadows","delete shadowcopies","shadows /all") and Cmd has "/quiet"),
+    IsWevtutilClear = toint(FileName =~ "wevtutil.exe" and (Cmd has " cl " or Cmd has "clear-log")),
+    IsBcdTamper = toint(FileName in~ ("bcdedit.exe","bcedit.exe") and Cmd has_any ("bootstatuspolicy","recoveryenabled","safeboot","nointegritychecks","set ")),
+    IsWbadminDelete = toint(FileName =~ "wbadmin.exe" and Cmd has_any ("delete","catalog","systemstatebackup")),
+    IsFsutilJournal = toint(FileName =~ "fsutil.exe" and Cmd has_any ("usn","deletejournal","setzerodata","behavior set")),
+    IsCipherWipe = toint(FileName =~ "cipher.exe" and Cmd has " /w"),
+    IsFirewallOff = toint(FileName =~ "netsh.exe" and Cmd has_any ("advfirewall","firewall") and Cmd has_any ("state off","set allprofiles state off")),
+    BadParent = toint(Parent in~ (SuspiciousParents))
+| extend
+    BaseScore = 50,
+    ActionScore =
+        (60 * IsShadowDelete) +
+        (60 * IsWevtutilClear) +
+        (35 * IsBcdTamper) +
+        (30 * IsWbadminDelete) +
+        (25 * IsFsutilJournal) +
+        (35 * IsCipherWipe) +
+        (35 * IsFirewallOff),
+    ContextScore =
+        (10 * BadParent),
+    RiskScore = tolong(BaseScore + ActionScore + ContextScore),
+    Severity = case(RiskScore >= 150, "CRITICAL", RiskScore >= 110, "HIGH", RiskScore >= 70, "MEDIUM", "LOW")
+| where RiskScore >= Threshold
+| extend HuntingDirectives = pack_array(
+    "[MIN_TRUTH] High-confidence defense evasion / recovery inhibition command executed.",
+    strcat("[SCORE] ", tostring(RiskScore), " | Severity=", Severity),
+    strcat("[PROC] ", FileName, " | Parent=", tostring(InitiatingProcessFileName)),
+    strcat("[CMD] ", substring(Cmd, 0, 260)),
+    "[NEXT] If unapproved: treat as ransomware precursor/active. Isolate host, capture volatile evidence, check for encryption activity, disable spread, and scope for same commands across fleet."
+)
+| project Timestamp, DeviceName, AccountName, FileName, RiskScore, Severity, InitiatingProcessFileName, ProcessCommandLine, HuntingDirectives
+| order by RiskScore desc, Timestamp desc
