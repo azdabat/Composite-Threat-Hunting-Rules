@@ -1,0 +1,48 @@
+// ============================================================================
+// WMI-A2B_L2_Fileless_Consumer_Execution_Scrcons_Substrate (Composite L2)
+// Author: Ala Dabat
+// Version: 2026-01-15 (v2)
+// Platform: Microsoft Defender XDR Advanced Hunting (MDE)
+// Tables: DeviceImageLoadEvents (required), DeviceNetworkEvents (optional), DeviceProcessEvents (optional)
+// MITRE: T1546.003 (WMI Event Subscription), T1047 (WMI), TA0011 (C2)
+// Status: PRODUCTION READY (Temporal Joins Fixed)
+// ============================================================================
+let lookback = 7d;
+let TimeWindow = 1m; // Very tight window for C2 beaconing
+
+let ScriptEngines = dynamic(["vbscript.dll","jscript.dll","scrobj.dll"]);
+
+let L2_Base = 
+    DeviceImageLoadEvents
+    | where Timestamp >= ago(lookback)
+    | where InitiatingProcessFileName =~ "scrcons.exe"
+    | where FileName in~ (ScriptEngines)
+    | extend DeviceId, Timestamp, DllName = FileName, FolderPath, Account = InitiatingProcessAccountName;
+
+L2_Base
+| join kind=leftouter (
+    DeviceNetworkEvents
+    | where Timestamp >= ago(lookback)
+    | where InitiatingProcessFileName =~ "scrcons.exe"
+    | where RemotePort in (80,443) or RemoteUrl has_any ("http","https")
+    | project NetTime = Timestamp, DeviceId, RemoteUrl, RemoteIP
+) on DeviceId
+// *** THE FIX: Temporal Constraint ***
+| where isnull(NetTime) or abs(NetTime - Timestamp) <= TimeWindow
+| summarize 
+    HasNet  = max(toint(isnotnull(NetTime))),
+    NetUrls = make_set(RemoteUrl, 10),
+    NetIPs  = make_set(RemoteIP, 10),
+    Evidence = any(strcat("scrcons loaded ", DllName))
+    by Timestamp, DeviceId, DeviceName, Account
+
+| extend Severity = case(
+    HasNet == 1, "HIGH",
+    "MEDIUM"
+)
+| extend HunterDirectives = case(
+    Severity == "HIGH", "HIGH: scrcons.exe loaded script engine AND beaconed to network. Potential Fileless Persistence execution.",
+    "MEDIUM: scrcons.exe loaded script engine. Check for legitimate WMI scripts (SCCM/Monitoring)."
+)
+| project Timestamp, Severity, DeviceName, Account, Evidence, HasNet, NetUrls, HunterDirectives
+| order by Severity desc
