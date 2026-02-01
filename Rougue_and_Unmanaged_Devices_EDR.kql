@@ -1,0 +1,208 @@
+// ============================================================================
+// COMPOSITE HUNT (L2/L2.5): Rogue / Unmanaged / Misconfigured Device Exposure
+// Author: Ala Dabat
+// Version: 2026-02-01 (v2.1) — PRODUCTION-HARDENED (Name-normalised + SourceConfidence + TVM mapping)
+// Status: READY FOR DEPLOYMENT (tenant tuning required)
+//
+// PURPOSE
+//   Detect endpoints that appear in enterprise telemetry but are:
+//     A) Unknown to Microsoft Defender inventory (shadow/unmanaged/spoofed asset risk), OR
+//     B) Known but not onboarded / misconfigured for EDR coverage (visibility/control-plane risk).
+//
+// WHY THIS EXISTS (Operational Control-Plane Reality)
+//   In mature SOC operations, many “missed incidents” are not detection failures — they are
+//   coverage failures (unmanaged devices, broken onboarding, EDR posture gaps).
+//   This hunt is a control-plane + asset-governance baseline that:
+//     - surfaces unmanaged/shadow assets,
+//     - highlights sensor/onboarding gaps,
+//     - and prioritises devices with EDR configuration issues.
+//
+// MINIMUM TRUTH (Truth Anchor)
+//   A device (hostname) appears in security telemetry within the lookback window.
+//   (Telemetry presence is non-negotiable. Everything else is reinforcement/scoring.)
+//
+// REINFORCEMENT (Prioritisation Only; does not redefine truth)
+//   R1: Device is missing from MDE DeviceInfo inventory (strong unmanaged signal).
+//   R2: OnboardingState is not “Onboarded” (EDR coverage gap).
+//   R3: TVM indicates EDR-related secure configuration noncompliance (EDR posture gap).
+//   R4: Hostname deviates from corporate naming convention (spoof / unmanaged / hygiene).
+//   R5: Multiple telemetry sources observed the device (confidence that it’s “real” in estate).
+//
+// NOISE CONTROLS / DESIGN NOTES
+//   - Name joins are fragile in real estates (FQDN vs short, casing, renames).
+//     This version normalises hostnames and uses a best-effort mapping strategy.
+//   - This is not “maliciousness proof.” It’s a high-value posture exposure hunt.
+//   - Tune ApprovedNamingPattern and lookback to your environment.
+//   - Add allowlists for known lab/test segments if needed.
+//
+// DATA SOURCES (MDE / Sentinel KQL)
+//   - DeviceInfo (inventory + onboarding truth)
+//   - DeviceNetworkEvents, DeviceProcessEvents, DeviceLogonEvents (telemetry truth anchor)
+//   - DeviceTvmSecureConfigurationAssessment (+KB) (EDR posture reinforcement)
+//
+// OUTPUT
+//   - RiskScore (explainable)
+//   - ExposureClass (Unmanaged vs CoverageGap vs EdrMisconfig)
+//   - HunterDirective (SOC-ready action guidance)
+//
+// MITRE (Contextual Mapping)
+//   This is primarily a CONTROL-PLANE / COVERAGE hunt (not a single ATT&CK technique),
+//   but it strongly supports detection & response against:
+//     - TA0005 Defense Evasion (operating off unmanaged/unmonitored hosts)
+//     - T1562 Impair Defenses (coverage gaps / disabled sensors can be leveraged)
+//     - TA0001 Initial Access & TA0008 Lateral Movement (rogue endpoints / footholds)
+//
+// ============================================================================
+
+// ---------------------------
+// 0) Tunables
+// ---------------------------
+let lookback = 30d;
+
+// Adjust to match your org naming conventions (example)
+let ApprovedNamingPattern = @"^ACME-(DC|SVC|SQL|WIN|LAP|ADMIN)-\d{2}$";
+
+// Normalise hostnames for safer joins (strip domain, lowercase)
+let NormalizeName = (n:string) {
+  tolower(split(tostring(n), ".")[0])
+};
+
+// ---------------------------
+// 1) Truth baseline: Latest Defender inventory (DeviceInfo)
+// ---------------------------
+let MDEInventory =
+  DeviceInfo
+  | where Timestamp >= ago(lookback)
+  | summarize arg_max(Timestamp, *) by DeviceId
+  | extend NormName = NormalizeName(DeviceName)
+  | project
+      MDE_DeviceId = DeviceId,
+      DeviceName,
+      NormName,
+      OSPlatform,
+      OnboardingState;
+
+// ---------------------------
+// 2) Truth anchor: Devices seen in telemetry (must exist somewhere)
+//    Add SourceCount as a confidence reinforcement.
+// ---------------------------
+let TelemetryDevices =
+  union isfuzzy=true
+    (DeviceNetworkEvents | where Timestamp >= ago(lookback) | project Timestamp, DeviceId, DeviceName, Source="Network"),
+    (DeviceProcessEvents | where Timestamp >= ago(lookback) | project Timestamp, DeviceId, DeviceName, Source="Process"),
+    (DeviceLogonEvents   | where Timestamp >= ago(lookback) | project Timestamp, DeviceId, DeviceName, Source="Logon")
+  | where isnotempty(DeviceName)
+  | extend NormName = NormalizeName(DeviceName)
+  | summarize
+      LastSeen         = max(Timestamp),
+      AnyDeviceId      = any(DeviceId),
+      Sources          = make_set(Source, 10),
+      SourceCount      = dcount(Source)
+    by NormName
+  | project NormName, LastSeen, TelemetryDeviceId = AnyDeviceId, Sources, SourceCount;
+
+// ---------------------------
+// 3) Reinforcement: TVM EDR secure configuration noncompliance
+//    Map via DeviceId -> NormName from inventory when possible.
+// ---------------------------
+let EdrConfigIssues =
+  DeviceTvmSecureConfigurationAssessment
+  | where Timestamp >= ago(lookback)
+  | where IsCompliant == 0 and IsApplicable == 1
+  | join kind=inner (DeviceTvmSecureConfigurationAssessmentKB) on ConfigurationId
+  | where ConfigurationSubcategory == "EDR"
+  | summarize
+      EdrIssueCount = count(),
+      EdrIssues     = make_set(ConfigurationName, 50)
+    by DeviceId
+  | join kind=leftouter (MDEInventory | project DeviceId = MDE_DeviceId, NormName) on DeviceId
+  | project NormName, EdrIssueCount, EdrIssues;
+
+// ---------------------------
+// 4) Converge + Score
+// ---------------------------
+TelemetryDevices
+| join kind=leftouter MDEInventory on NormName
+| join kind=leftouter EdrConfigIssues on NormName
+| extend
+    NameOk        = toint(NormName matches regex ApprovedNamingPattern),
+    IsUnknownToMDE= toint(isnull(MDE_DeviceId)),
+    IsOnboarded   = toint(OnboardingState == "Onboarded"),
+    HasEdrIssues  = toint(coalesce(EdrIssueCount, 0) > 0),
+    MultiSource   = toint(SourceCount >= 2) // confidence reinforcement (seen in ≥2 tables)
+| extend
+    // Explainable scoring (tune weights per tenant)
+    RiskScore =
+        0
+      + iif(NameOk == 0,         4, 0)  // naming anomaly
+      + iif(IsUnknownToMDE == 1, 5, 0)  // strongest unmanaged signal
+      + iif(IsOnboarded == 0,    3, 0)  // coverage gap
+      + iif(HasEdrIssues == 1,   4, 0)  // posture gap
+      + iif(MultiSource == 1,    2, 0)  // confidence boost
+| where RiskScore >= 4
+
+// ---------------------------
+// 5) Classification + Severity
+// ---------------------------
+| extend ExposureClass = case(
+    IsUnknownToMDE == 1,                    "UnmanagedOrUnknownToMDE",
+    IsOnboarded == 0,                       "EDRCoverageGap_NotOnboarded",
+    HasEdrIssues == 1 and IsOnboarded == 1, "EDRPostureGap_Misconfigured",
+    "Other"
+)
+| extend Severity = case(
+    IsUnknownToMDE == 1 and NameOk == 0, "CRITICAL",
+    IsUnknownToMDE == 1,                 "HIGH",
+    IsOnboarded == 0,                    "HIGH",
+    HasEdrIssues == 1,                   "HIGH",
+    NameOk == 0,                         "MEDIUM",
+    "MEDIUM"
+)
+
+// ---------------------------
+// 6) Hunter-first directives (SOC-ready)
+// ---------------------------
+| extend HunterDirective = case(
+    Severity == "CRITICAL" and ExposureClass == "UnmanagedOrUnknownToMDE",
+      "CRITICAL: Telemetry-visible host is UNKNOWN to Defender inventory and breaks naming standard. Validate CMDB/AD/DHCP/NAC. If unrecognised: quarantine/isolate, identify segment/owner, and pivot to recent authentications + lateral movement from this host.",
+
+    Severity == "HIGH" and ExposureClass == "UnmanagedOrUnknownToMDE",
+      "HIGH: Telemetry-visible host missing from Defender inventory. Treat as unmanaged/shadow IT or attacker-controlled endpoint. Identify owner + segment, confirm AD computer object/DHCP lease, and prioritise onboarding or isolation.",
+
+    Severity == "HIGH" and ExposureClass == "EDRCoverageGap_NotOnboarded",
+      "HIGH: Host appears in telemetry but is not fully onboarded to EDR. Confirm sensor deployment, remediate onboarding, and validate logging ingestion/health. Pivot to suspicious activity during the uncovered window.",
+
+    Severity == "HIGH" and ExposureClass == "EDRPostureGap_Misconfigured",
+      "HIGH: Onboarded host has EDR secure configuration gaps (TVM EDR subcategory). Fix policy/sensor settings, confirm protections enabled, and review recent detections/logons for missed activity.",
+
+    Severity == "MEDIUM" and NameOk == 0,
+      "MEDIUM: Hostname deviates from naming standard. Validate if legitimate exception; check AD computer object, recent rename events, and network segment context.",
+
+    "Investigate device legitimacy, ownership, and ensure full inventory + EDR coverage."
+)
+
+// ---------------------------
+// 7) Output
+// ---------------------------
+| project
+    LastSeen,
+    DeviceName = coalesce(DeviceName, NormName),
+    NormName,
+    TelemetryDeviceId,
+    MDE_DeviceId,
+    OSPlatform,
+    OnboardingState,
+    Sources,
+    SourceCount,
+    NameOk,
+    IsUnknownToMDE,
+    IsOnboarded,
+    HasEdrIssues,
+    EdrIssueCount,
+    EdrIssues,
+    ExposureClass,
+    RiskScore,
+    Severity,
+    HunterDirective
+| order by RiskScore desc, LastSeen desc
+```0
