@@ -48,36 +48,36 @@ let Rundll_ControlToken      = "control_rundll";
 
 // --------------------
 // 1) Tenant tuning (noise suppression)
-// --------------------
+// --------------------                                                      
 let AllowInitiatingParents = dynamic([
-  "sihclient.exe","usoclient.exe","trustedinstaller.exe","tiworker.exe",
-  "msiexec.exe","setuphost.exe","omadmclient.exe","ccmexec.exe","wuauclt.exe"
+  "sihclient.exe","usoclient.exe","trustedinstaller.exe","tiworker.exe",                  // 
+  "msiexec.exe","setuphost.exe","omadmclient.exe","ccmexec.exe","wuauclt.exe"             //
 ]);
 
-let AllowKeywords = dynamic([
+let AllowKeywords = dynamic([                                                        //
   "\\microsoft\\windows\\",
-  "onedrive","teams","edgeupdate","googleupdate",
-  "sccm","ccm","intune","defender","microsoft update",
-  "microsoftedgeupdatetask","microsoft edge update"
+  "onedrive","teams","edgeupdate","googleupdate",                                  //
+  "sccm","ccm","intune","defender","microsoft update",                             //
+  "microsoftedgeupdatetask","microsoft edge update"                               //
 ]);
 
 // --------------------
-// 2) Minimum Truth: schtasks.exe /create OR /change
+// 2) Minimum Truth: schtasks.exe /create OR /change                            // 
 // --------------------
-DeviceProcessEvents
+DeviceProcessEvents                                                             //
 | where Timestamp >= ago(Lookback)
-| where FileName =~ "schtasks.exe"
+| where FileName =~ "schtasks.exe"                                              //
 | where isnotempty(ProcessCommandLine)
-| extend Cmd = tolower(tostring(ProcessCommandLine))
-| where Cmd has_any ("/create", "/change")
+| extend Cmd = tolower(tostring(ProcessCommandLine))                           //
+| where Cmd has_any ("/create", "/change")                                    //
 
 // --------------------
-// 3) Parse task parameters (quoted + unquoted)
+// 3) Parse task parameters (quoted + unquoted)                            //   
 // --------------------
-| extend
+| extend                                                                  // 
     // /tn
-    TaskName_q = extract(@"(?i)(?:/tn\s+)(?:""([^""]+)""|([^\s]+))", 1, ProcessCommandLine),
-    TaskName_u = extract(@"(?i)(?:/tn\s+)(?:""([^""]+)""|([^\s]+))", 2, ProcessCommandLine),
+    TaskName_q = extract(@"(?i)(?:/tn\s+)(?:""([^""]+)""|([^\s]+))", 1, ProcessCommandLine),                    //
+    TaskName_u = extract(@"(?i)(?:/tn\s+)(?:""([^""]+)""|([^\s]+))", 2, ProcessCommandLine),                   //        
     TaskName   = coalesce(TaskName_q, TaskName_u),
 
     // /tr
