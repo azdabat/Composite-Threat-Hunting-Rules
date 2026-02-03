@@ -1,0 +1,315 @@
+// ============================================================================
+// WMI-A2B_L2_Fileless_Consumer_Execution_Scrcons_Substrate (Composite L2)
+// Author: Ala Dabat
+// Version: 2026-01-15 (v2.3) — Reinforcement-only + PID-safe join + time math safe
+// Platform: Microsoft Defender XDR Advanced Hunting (MDE)
+// Tables: DeviceImageLoadEvents (required), DeviceNetworkEvents (optional)
+// MITRE: T1546.003, T1047, TA0011 (reinforcement only)
+// ============================================================================
+
+let lookback   = 7d;
+let TimeWindow = 1m;
+let RarityLB   = 30d;
+
+let ScriptEngines = dynamic(["vbscript.dll","jscript.dll","scrobj.dll"]);
+
+let IsSystemPath = (path:string) {
+    let p = tolower(path);
+    p startswith "c:\\windows\\system32\\"
+    or p startswith "c:\\windows\\syswow64\\"
+    or p startswith "c:\\windows\\winsxs\\"
+};
+
+let TimeWindowSeconds = toint(TimeWindow / 1s);
+
+// ----------------------------
+// L2 BASELINE (Truth Anchor)
+// ----------------------------
+let L2_Base =
+DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessFileName =~ "scrcons.exe"
+| where FileName in~ (ScriptEngines) // vbscript.dll","jscript.dll","scrobj.dll loaded into scrcons is a closed process like word macros and are unseen by analysts. This is where the attack lives
+| extend
+    BaseTime = Timestamp,
+    DeviceId,
+    DeviceName,
+    Account  = coalesce(InitiatingProcessAccountName, AccountName),
+    DllName  = tostring(FileName),
+    DllPath  = tostring(FolderPath),
+    PID      = tolong(InitiatingProcessId)
+| project BaseTime, DeviceId, DeviceName, Account, DllName, DllPath, PID;
+
+// ----------------------------
+// R1 (Optional): Network events
+// ----------------------------
+let R1_Net =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessFileName =~ "scrcons.exe"
+| where RemotePort in (80,443) or RemoteUrl has_any ("http","https")
+| extend
+    NetTime = Timestamp,
+    DeviceId,
+    NetPID   = tolong(InitiatingProcessId), // Always catch on PID, in case Device telemetry does not correlate within the attack ecosystem. SEE: PID Renforcement join.
+    RemoteUrl = tostring(RemoteUrl),
+    RemoteIP  = tostring(RemoteIP),
+    RemotePort
+| project NetTime, DeviceId, NetPID, RemoteUrl, RemoteIP, RemotePort;
+
+// ----------------------------
+// R2 (Optional): Prevalence
+// ----------------------------
+let R2_Prevalence =
+DeviceImageLoadEvents
+| where Timestamp >= ago(RarityLB)
+| where InitiatingProcessFileName =~ "scrcons.exe"
+| where FileName in~ (ScriptEngines)
+| summarize DeviceSeenDays = dcount(bin(Timestamp, 1d)) by DeviceId; // Has this specific device seen this behavior on only 1 day (or fewer) in the last 30 days
+// ----------------------------
+// Base + prevalence + path anomaly
+// ----------------------------
+let BaseWithPrev =
+L2_Base
+| join kind=leftouter (R2_Prevalence) on DeviceId
+| extend
+    DeviceSeenDays = coalesce(DeviceSeenDays, 0),
+    IsRareOnDevice = toint(DeviceSeenDays <= 1),                   //IsRareOnDevice == 1: "This is the first time (or the only day) we have ever seen this happen on this machine." -> Suspicious.
+    NonSystemDllPath = toint(IsSystemPath(DllPath) == false);      //IsRareOnDevice == 0: "This machine does this all the time (on 2+ different days)." -> Likely Benign (Noise).
+
+// ----------------------------
+// Reinforcement Join Strategy
+//   - Prefer PID join when PID exists
+//   - Fallback to DeviceId join when PID missing
+// ----------------------------
+let PID_Path =
+BaseWithPrev
+| where isnotnull(PID)                 //demands that the exact same Process ID (PID) is responsible for both the base event (e.g., the Image Load) and the network event.                            
+| join kind=leftouter (R1_Net) on DeviceId
+| extend
+    PIDMatch = toint(isnotnull(NetPID) and PID == NetPID),      // If scrcons.exe (PID 5555) is matched with a network connection else if chrome.exe (PID 9999), this becomes 0. It only becomes 1 if the PIDs match perfectly.              
+    TimeMatch = toint(isnotempty(NetTime) and abs(datetime_diff("second", NetTime, BaseTime)) <= TimeWindowSeconds), // returns 1 only if the network connection happened within your defined window (e.g., 60 seconds) of the process event.
+    HasNet = toint(PIDMatch == 1 and TimeMatch == 1);   // HasNet = 1 if same device and same PID happened at the same time.
+                                                     
+let Fallback_Path =
+BaseWithPrev
+| where isnull(PID)                          //This ensures this block only runs on the specific rows that the previous "High Fidelity" block threw away. & It prevents double-counting. If a row had a PID, it was already handled by the PID_Path.
+| join kind=leftouter (R1_Net) on DeviceId   // Because it cannot match on specific process execution (PID), it falls back to the only thing it knows: "It happened on this specific machine.
+| extend
+    TimeMatch = toint(isnotempty(NetTime) and abs(datetime_diff("second", NetTime, BaseTime)) <= TimeWindowSeconds), // Since we can't verify who made the connection (Process A vs Process B), we have to rely entirely on "When" it happened.
+    HasNet = toint(TimeMatch == 1);                                                                                  // If scrcons.exe (with no PID) ran at 12:00:00, and any network connection left this device at 12:00:01, we will assume they are related
+
+// ----------------------------
+// Combine + Score (reinforcement only)
+// ----------------------------
+union PID_Path, Fallback_Path
+| extend
+    ReinforcementScore =
+        (60 * HasNet)
+      + (20 * IsRareOnDevice)
+      + (30 * NonSystemDllPath),
+    TotalScore = 50 + ReinforcementScore
+| summarize
+    FirstSeen = min(BaseTime),
+    LastSeen  = max(BaseTime),
+    HasNet    = max(HasNet),
+    NetUrls   = make_set_if(RemoteUrl, HasNet == 1, 10),
+    NetIPs    = make_set_if(RemoteIP,  HasNet == 1, 10),
+    AnyRareOnDevice = max(IsRareOnDevice),
+    AnyNonSystemDll = max(NonSystemDllPath),
+    Evidence = make_set(strcat("scrcons loaded ", DllName, " from ", DllPath), 10),
+    MaxTotalScore = max(TotalScore)
+  by DeviceId, DeviceName, Account
+| extend Severity = case(
+    HasNet == 1 and AnyNonSystemDll == 1, "CRITICAL",
+    HasNet == 1,                           "HIGH",
+    AnyNonSystemDll == 1,                  "HIGH",
+    AnyRareOnDevice == 1,                  "MEDIUM",
+    "MEDIUM"
+)
+| extend HunterDirectives = case(
+    Severity == "CRITICAL",
+        "CRITICAL: scrcons script-engine substrate + near-time network + non-system DLL path. Treat as fileless WMI consumer execution until disproven.",
+    Severity == "HIGH" and HasNet == 1,
+        "HIGH: scrcons loaded script engine and made near-time HTTP/HTTPS. Investigate RemoteUrl/RemoteIP; check for repeat beaconing; validate WMI subscription artifacts.",
+    Severity == "HIGH" and AnyNonSystemDll == 1,
+        "HIGH: scrcons loaded script engine DLL from non-system path. Validate DLL hash/signature and how it landed.",
+    AnyRareOnDevice == 1,
+        "MEDIUM: substrate is rare on this device. Baseline host role + management tooling; promote if repeated or paired with network.",
+    "MEDIUM: substrate detected. Confirm legitimate WMI consumer usage and monitor for reinforcement (network / anomalous path)."
+)
+| project
+    FirstSeen, LastSeen,
+    Severity, MaxTotalScore,
+    DeviceName, DeviceId, Account,
+    HasNet, NetUrls, NetIPs,
+    AnyRareOnDevice, AnyNonSystemDll,
+    Evidence,
+    HunterDirectives
+| order by Severity desc, MaxTotalScore desc, LastSeen desc
+
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//NOTES
+//PID_Path (Previous Step): High Precision. Almost zero False Positives.
+//Fallback_Path (This Step): High Sensitivity, Higher False Positives.
+//Risk: If scrcons.exe runs at the exact same second that a user browses a website, this fallback path might incorrectly flag that website as being connected to scrcons.
+
+
+// ============================================================================
+// IR PLAYBOOK (SOC-READY) — Remediation & Response Guidance (IR Framework)
+// Scope: WMI Permanent Event Subscriptions / Fileless Consumers leading to scrcons.exe script-engine execution
+// Goal: Triage → Contain → Eradicate → Recover → Lessons Learned (PICERL / NIST-aligned)
+// IMPORTANT: Treat "scrcons + script-engine DLL load" as substrate evidence. Root cause is usually:
+//   - Malicious WMI Event Filter + Consumer + Binding
+//   - Or management tooling misused (less common, but possible)
+// ============================================================================
+//
+// 0) QUICK SEVERITY INTERPRETATION (Map to Actions)
+// -------------------------------------------------
+// CRITICAL (HasNet=1 AND NonSystemDllPath=1):
+//   - Assume active intrusion or active payload execution.
+//   - Immediate containment recommended (network isolation) while preserving evidence.
+// HIGH (HasNet=1 OR NonSystemDllPath=1):
+//   - Prioritize same-day response. Containment if business impact acceptable.
+// MEDIUM (Rare substrate only):
+//   - Validate legitimacy, baseline host role; escalate if repeated or correlated.
+//
+// 1) IDENTIFICATION / TRIAGE (Minimum Truth → Reinforcement → Decision)
+// --------------------------------------------------------------------
+// A. Confirm the substrate event details:
+//   - Confirm DeviceName/DeviceId, Account, time window (FirstSeen/LastSeen).
+//   - Confirm which DLL loaded (vbscript/jscript/scrobj) and from which FolderPath.
+//   - If DllPath is non-system: treat as potential staging path and collect file metadata.
+//
+// B. If HasNet=1 (NetUrls/NetIPs populated):
+//   - Determine whether connections repeat (beacon-like).
+//   - Extract indicators: RemoteIP, RemoteUrl, RemotePort, timestamps.
+//   - Check if RemoteUrl is direct IP, newly registered domain, or suspicious pathing.
+//
+// C. Validate "Expected scrcons usage" in environment:
+//   - scrcons.exe is associated with WMI script consumer activity; most endpoints should not
+//     frequently run script-based consumers unless specific IT tooling uses it.
+//   - If DeviceSeenDays >= 2 and host is known management/automation box, lower priority ONLY
+//     after verifying the WMI artifacts are legitimate.
+//
+// 2) SCOPING (Find breadth fast before you touch the endpoint)
+// ------------------------------------------------------------
+// A. Find other affected devices in lookback:
+//   - Run this rule across org; pivot by NetIP/NetUrl + AnyNonSystemDll + Account.
+// B. Look for same RemoteIP/RemoteUrl across multiple hosts.
+// C. Look for same non-system DllPath patterns across hosts (e.g., ProgramData\*, Users\Public\*, Temp\*).
+// D. If account appears across multiple devices, treat as potential credential compromise.
+//
+// 3) CONTAINMENT (Stop execution & stop spread, preserve evidence)
+// ---------------------------------------------------------------
+// Choose containment level based on Severity and business tolerance:
+//
+// A. CRITICAL recommended actions:
+//   - Isolate device in Defender (preferred) OR remove from network via EDR tooling.
+//   - Block indicators temporarily (domain/IP) at proxy/firewall if validated suspicious.
+//   - Disable suspected user account sessions if signs of compromise (force sign-out / reset).
+//
+// B. HIGH recommended actions:
+//   - If HasNet=1: consider isolate or at least block egress to NetIPs/NetUrls.
+//   - Increase monitoring on device (high-frequency telemetry) and restrict admin tools.
+//
+// Evidence preservation note:
+//   - Before remediation, capture: process tree, network connections, WMI subscription state,
+//     and suspicious file hashes (if non-system DLL).
+//
+// 4) ERADICATION (Remove persistence: WMI subscription + payload staging)
+// ---------------------------------------------------------------------
+// Key objective: Remove malicious WMI Permanent Event Subscription components:
+//   - Event Filter
+//   - Event Consumer (CommandLineEventConsumer / ActiveScriptEventConsumer / etc.)
+//   - FilterToConsumerBinding
+//
+// A. Enumerate WMI Permanent Event Subscriptions (local admin required):
+//   - PowerShell (modern):
+//       Get-CimInstance -Namespace root\subscription -ClassName __EventFilter
+//       Get-CimInstance -Namespace root\subscription -ClassName __EventConsumer
+//       Get-CimInstance -Namespace root\subscription -ClassName __FilterToConsumerBinding
+//
+//   - Legacy WMIC (if needed):
+//       wmic /namespace:\\root\subscription PATH __EventFilter get Name,Query,EventNamespace
+//       wmic /namespace:\\root\subscription PATH __EventConsumer get Name
+//       wmic /namespace:\\root\subscription PATH __FilterToConsumerBinding get Filter,Consumer
+//
+// B. What to look for (high-signal suspicious traits):
+//   - Consumer types:
+//       * ActiveScriptEventConsumer (VBScript/JScript payload)
+//       * CommandLineEventConsumer (cmd/powershell/mshta/rundll32/wscript/cscript)
+//   - ScriptText / CommandLine containing:
+//       * Encoded/obfuscated blobs, long base64, strange concatenation, LOLBins,
+//         web retrieval (http/https), or temp/public/programdata paths.
+//   - Filter queries that trigger on common events:
+//       * Win32_ProcessStartTrace, __InstanceCreationEvent, logon triggers,
+//         timers (e.g., within polling interval), or suspicious WMI namespaces.
+//
+// C. Remove malicious artifacts (ONLY after recording names/contents for evidence):
+//   - Remove bindings first (prevents trigger):
+//       Get-CimInstance -Namespace root\subscription -ClassName __FilterToConsumerBinding | Remove-CimInstance
+//     (Or remove only the specific binding objects tied to the malicious filter/consumer.)
+//
+//   - Then remove the consumer:
+//       Get-CimInstance -Namespace root\subscription -ClassName __EventConsumer | ? Name -eq "<name>" | Remove-CimInstance
+//
+//   - Then remove the filter:
+//       Get-CimInstance -Namespace root\subscription -ClassName __EventFilter | ? Name -eq "<name>" | Remove-CimInstance
+//
+// D. If NonSystemDllPath=1:
+//   - Collect hash, signer, compile timestamp (if PE), prevalence in org.
+//   - Quarantine/remove the staged DLL after confirming it is not legitimate tooling.
+//   - Investigate how it arrived: download, email, USB, lateral drop, admin share.
+//
+// 5) RECOVERY (Return host safely to service)
+// ------------------------------------------
+// A. Reimage vs clean decision:
+//   - If CRITICAL with confirmed malicious consumer, or if additional malware found,
+//     strongly consider rebuild/reimage (highest assurance).
+//   - If cleanable and isolated quickly:
+//       * Validate no remaining WMI subscription artifacts.
+//       * Validate no scheduled tasks/services/run keys added as secondary persistence.
+//       * Validate Defender scan results, startup items, and autoruns hygiene.
+//
+// B. Credential hygiene:
+//   - If the triggering Account is privileged or reused across hosts, rotate credentials.
+//   - Invalidate tokens/sessions where applicable (especially if you see multi-host scope).
+//
+// C. Post-recovery monitoring (minimum):
+//   - Watch for scrcons.exe + script engines recurrence for 14 days.
+//   - Watch for recreation of the same WMI filter/consumer names or similar query patterns.
+//   - Watch outbound to the same NetIPs/NetUrls.
+//
+// 6) LESSONS LEARNED / HARDENING (Make it harder next time)
+// ---------------------------------------------------------
+// A. Detection/Telemetry improvements:
+//   - Ensure root\subscription auditing/visibility where possible.
+//   - Add complementary hunts:
+//       * WMI consumer creation/modification events (if available in your stack).
+//       * Script engine DLL load from non-system paths (generic across hosts).
+//       * scrcons.exe network egress (tight allow-listing).
+//
+// B. Preventive controls:
+//   - Constrain who can create WMI permanent event subscriptions.
+//   - Application control (WDAC/AppLocker) to restrict script hosts / LOLBins in user space.
+//   - Network egress filtering for endpoints (block direct-to-internet where possible).
+//
+// C. Documentation deliverables (for IR closure):
+//   - Timeline: FirstSeen → containment → eradication → recovery.
+//   - IOCs: NetIPs/NetUrls, file hashes, WMI artifact names/queries/scripttext.
+//   - Root cause & entry vector hypothesis (phish, drive-by, RMM abuse, stolen creds).
+//
+// 7) “DON’T GET TRICKED” — False Positive Guardrails
+// -------------------------------------------------
+// A. scrcons substrate does not automatically mean malicious.
+//   - If DeviceSeenDays is high AND host role supports automation, it may be legitimate.
+// B. Fallback_Path risk:
+//   - Network correlation may be incidental if PID missing.
+//   - Always validate process/PID linkage where possible before blocking benign URLs.
+// C. If only vbscript/jscript load occurred (no net, system path, not rare):
+//   - Treat as baseline observation, not incident.
+//
+// ============================================================================
+// END IR PLAYBOOK
+// ============================================================================
